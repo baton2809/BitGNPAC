@@ -441,6 +441,18 @@ def run_agent(model: str, harness_url: str, task_text: str) -> None:
         elapsed_ms = int((time.time() - started) * 1000)
         job = resp.choices[0].message.parsed
 
+        if job is None:
+            raw = resp.choices[0].message.content or ""
+            print(f"{CLI_RED}PARSE FAIL (model returned unparseable response){CLI_CLR}\n  raw={raw[:200]}")
+            vm.answer(
+                AnswerRequest(
+                    message="Agent failed to parse structured LLM response. Model may not support JSON schema.",
+                    outcome=Outcome.OUTCOME_ERR_INTERNAL,
+                    refs=[],
+                )
+            )
+            break
+
         print(
             job.plan_remaining_steps_brief[0],
             f"({elapsed_ms} ms)\n  {job.function}",
