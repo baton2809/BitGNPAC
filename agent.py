@@ -42,6 +42,100 @@ CLI_CLR    = "\x1B[0m"
 CLI_BLUE   = "\x1B[34m"
 CLI_YELLOW = "\x1B[33m"
 CLI_CYAN   = "\x1B[36m"
+CLI_BOLD   = "\x1B[1m"
+CLI_DIM    = "\x1B[2m"
+
+
+# ─── Verbose logger ────────────────────────────────────────────────────────────
+
+def _sep(char="─", width=72):
+    return char * width
+
+
+def log_header(task_id: str, instruction: str) -> None:
+    print(f"\n{CLI_BOLD}{'=' * 72}{CLI_CLR}")
+    print(f"{CLI_BOLD}  Task: {task_id}{CLI_CLR}")
+    print(f"{'=' * 72}")
+    print(f"{CLI_CYAN}{instruction}{CLI_CLR}")
+    print(_sep())
+
+
+def log_bootstrap(name: str, result: str) -> None:
+    args_str = f"path='/{name}'" if name not in ("context", "tree") else ""
+    print(f"\n{CLI_DIM}[bootstrap]{CLI_CLR} {CLI_GREEN}tool='{name}'{CLI_CLR} {args_str}")
+    print(f"{CLI_DIM}OUT:{CLI_CLR}")
+    for line in result.splitlines():
+        print(f"  {line}")
+
+
+def log_step_header(step: int, total: int, reasoning: str) -> None:
+    print(f"\n{_sep('─')}")
+    label = f"Next step_{step}..."
+    if reasoning:
+        # Trim reasoning to first 120 chars for readability
+        short = reasoning.replace("\n", " ").strip()[:120]
+        print(f"{CLI_BOLD}{label}{CLI_CLR} {CLI_DIM}{short}{CLI_CLR}")
+    else:
+        print(f"{CLI_BOLD}{label}{CLI_CLR}")
+
+
+def log_tool_call(name: str, args: dict, elapsed_ms: int) -> None:
+    # Format as: tool='write' path='/outbox/123.json' content='...'
+    parts = [f"{CLI_GREEN}tool='{name}'{CLI_CLR}"]
+    for k, v in args.items():
+        v_str = str(v)
+        if len(v_str) > 80:
+            v_str = v_str[:77] + "..."
+        # Don't quote booleans/numbers
+        if isinstance(v, (bool, int, float)):
+            parts.append(f"{k}={v}")
+        else:
+            parts.append(f"{k}='{v_str}'")
+    print("  " + " ".join(parts) + f"  {CLI_DIM}[{elapsed_ms}ms]{CLI_CLR}")
+
+
+def log_tool_output(result: str, prefix: str = "OUT") -> None:
+    print(f"  {CLI_DIM}{prefix}:{CLI_CLR}")
+    for line in result.splitlines():
+        print(f"    {line}")
+
+
+def log_blocked(reason: str) -> None:
+    print(f"  {CLI_RED}BLOCKED: {reason}{CLI_CLR}")
+
+
+def log_security(threat: str) -> None:
+    print(f"\n  {CLI_RED}{'!' * 60}{CLI_CLR}")
+    print(f"  {CLI_RED}INJECTION DETECTED: {threat}{CLI_CLR}")
+    print(f"  {CLI_RED}{'!' * 60}{CLI_CLR}")
+
+
+def log_stagnation() -> None:
+    print(f"  {CLI_YELLOW}⚠ STAGNATION — same call repeated, aborting{CLI_CLR}")
+
+
+def log_completion(outcome: str, message: str, steps: list, refs: list) -> None:
+    print(f"\n{_sep('═')}")
+    color = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
+    print(f"{color}{CLI_BOLD}AGENT ANSWER: {outcome}{CLI_CLR}")
+    print(f"  {message}")
+    if steps:
+        print(f"\n  {CLI_DIM}Steps completed:{CLI_CLR}")
+        for s in steps:
+            print(f"    • {s}")
+    if refs:
+        print(f"\n  {CLI_DIM}Grounding refs:{CLI_CLR}")
+        for r in refs:
+            print(f"    - {CLI_BLUE}{r}{CLI_CLR}")
+    print(_sep('═'))
+
+
+def log_error(label: str, msg: str) -> None:
+    print(f"  {CLI_RED}✗ {label}: {msg}{CLI_CLR}")
+
+
+def log_warn(msg: str) -> None:
+    print(f"  {CLI_YELLOW}⚠ {msg}{CLI_CLR}")
 
 OUTCOME_BY_NAME = {
     "OUTCOME_OK":                 Outcome.OUTCOME_OK,
@@ -594,7 +688,7 @@ def run_agent(
     log = [{"role": "system", "content": system}]
 
     try:
-        # Bootstrap: context → tree (AGENTS.md already in system prompt via wiki_content)
+        # ── Bootstrap: context → tree ────────────────────────────────────────
         for name, args in [
             ("context", {}),
             ("tree",    {"root": "/", "level": 2}),
@@ -603,7 +697,7 @@ def run_agent(
                 result = dispatch_tool(vm, name, args)
             except ConnectError as exc:
                 result = f"(bootstrap error: {exc.message})"
-            print(f"{CLI_GREEN}AUTO {name}{CLI_CLR}: {result[:300]}")
+            log_bootstrap(name, result)
             log.append({"role": "user", "content": result})
 
         log.append({"role": "user", "content": task_text})
@@ -611,7 +705,6 @@ def run_agent(
         grounding_refs: list[str] = []
 
         for i in range(40):
-            print(f"\nStep {i+1}/40... ", end="", flush=True)
             started = time.time()
 
             # ── LLM call with retry ──────────────────────────────────────────
@@ -627,7 +720,7 @@ def run_agent(
                     break
                 except (APIStatusError, APIConnectionError) as _api_err:
                     wait = 2 ** _attempt
-                    print(f"{CLI_YELLOW}LLM error ({_api_err}), retry in {wait}s...{CLI_CLR}")
+                    log_warn(f"LLM error ({_api_err}), retry in {wait}s...")
                     time.sleep(wait)
             else:
                 _submit_answer("LLM API failed after 3 retries.", Outcome.OUTCOME_ERR_INTERNAL, grounding_refs)
@@ -638,12 +731,17 @@ def run_agent(
             finish = resp.choices[0].finish_reason
             log.append(msg.model_dump(exclude_unset=False))
 
+            # Show model reasoning/content text if present
+            reasoning = (msg.content or "").strip()
+            log_step_header(i + 1, 40, reasoning)
+
             # ── No tool call ─────────────────────────────────────────────────
             if not msg.tool_calls:
-                text = msg.content or ""
-                print(f"{CLI_YELLOW}[no tool, finish={finish}]{CLI_CLR} {text[:200]}")
+                log_warn(f"No tool call (finish={finish}). Agent stopped.")
+                if reasoning:
+                    log_tool_output(reasoning, prefix="MODEL TEXT")
                 _submit_answer(
-                    f"Agent stopped without report_completion (finish={finish}): {text[:300]}",
+                    f"Agent stopped without report_completion (finish={finish}): {reasoning[:300]}",
                     Outcome.OUTCOME_ERR_INTERNAL,
                     grounding_refs,
                 )
@@ -656,24 +754,23 @@ def run_agent(
             except json.JSONDecodeError:
                 tool_args = {}
 
-            print(f"{CLI_BLUE}{tool_name}{CLI_CLR}({json.dumps(tool_args)[:120]}) [{elapsed_ms}ms]")
+            log_tool_call(tool_name, tool_args, elapsed_ms)
 
             # ── Guard: template files ─────────────────────────────────────────
             if tool_name in ("delete", "write"):
                 path     = tool_args.get("path", "")
                 basename = path.rstrip("/").split("/")[-1]
                 if basename.startswith("_"):
-                    blocked = f"Blocked: refusing to {tool_name} template file '{path}'"
-                    print(f"{CLI_RED}{blocked}{CLI_CLR}")
-                    log.append({"role": "tool", "tool_call_id": tc.id, "content": blocked})
+                    blocked = f"refusing to {tool_name} template file '{path}'"
+                    log_blocked(blocked)
+                    log.append({"role": "tool", "tool_call_id": tc.id, "content": f"Blocked: {blocked}"})
                     continue
 
             # ── verify_done ───────────────────────────────────────────────────
             if tool_name == "verify_done":
-                nonlocal_verify = True
                 verify_done_called = True
                 result = _handle_verify_done(vm, tool_args)
-                print(f"{CLI_CYAN}verify_done{CLI_CLR}: {result[:400]}")
+                log_tool_output(result, prefix="VERIFY")
                 log.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                 continue
 
@@ -693,17 +790,11 @@ def run_agent(
                             r for r in grounding_refs if not r.startswith("(")
                         )))
                     )
-                    print(f"{CLI_YELLOW}[nudge] forcing verify_done before report_completion{CLI_CLR}")
+                    log_warn("Forcing verify_done before report_completion(OUTCOME_OK)")
                     log.append({"role": "tool", "tool_call_id": tc.id, "content": nudge})
                     continue
 
-                color = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
-                print(f"{color}→ {outcome}{CLI_CLR}: {message}")
-                for s in steps:
-                    print(f"  - {s}")
-                for r in refs:
-                    print(f"  {CLI_BLUE}{r}{CLI_CLR}")
-
+                log_completion(outcome, message, steps, refs)
                 _submit_answer(
                     message,
                     OUTCOME_BY_NAME.get(outcome, Outcome.OUTCOME_ERR_INTERNAL),
@@ -713,31 +804,30 @@ def run_agent(
 
             # ── Stagnation ────────────────────────────────────────────────────
             if stagnation.check(tool_name, tool_args):
-                print(f"{CLI_YELLOW}STAGNATION x{stagnation.threshold}{CLI_CLR}")
+                log_stagnation()
                 _submit_answer("Stagnation: same tool called repeatedly.", Outcome.OUTCOME_ERR_INTERNAL, grounding_refs)
                 return action_log
 
             # ── Execute ───────────────────────────────────────────────────────
             try:
                 result = dispatch_tool(vm, tool_name, tool_args)
-                print(f"{CLI_GREEN}OK{CLI_CLR}: {result[:300]}")
             except ConnectError as exc:
-                print(f"{CLI_YELLOW}ConnectError: {exc.message} — retrying...{CLI_CLR}")
+                log_warn(f"ConnectError: {exc.message} — retrying...")
                 time.sleep(1)
                 try:
                     result = dispatch_tool(vm, tool_name, tool_args)
-                    print(f"{CLI_GREEN}RETRY OK{CLI_CLR}: {result[:200]}")
+                    log_warn("Retry succeeded.")
                 except ConnectError as exc2:
                     result = f"Error: {exc2.message}"
-                    print(f"{CLI_RED}FAIL: {exc2.message}{CLI_CLR}")
+                    log_error("ConnectError", exc2.message)
             except ValueError as exc:
                 result = f"Unknown tool: {exc}"
-                print(f"{CLI_RED}{result}{CLI_CLR}")
+                log_error("ValueError", str(exc))
 
             # ── Security scan ─────────────────────────────────────────────────
             threat = _scan_for_injection(result)
             if threat:
-                print(f"{CLI_RED}INJECTION: {threat}{CLI_CLR}")
+                log_security(threat)
                 _submit_answer(
                     f"Security threat in content: {threat}",
                     Outcome.OUTCOME_DENIED_SECURITY,
@@ -745,14 +835,16 @@ def run_agent(
                 )
                 return action_log
 
-            # ── Post-write validation ──────────────────────────────────────────
+            # ── Post-write validation ─────────────────────────────────────────
             if tool_name == "write":
-                path     = tool_args.get("path", "")
-                content  = tool_args.get("content", "")
-                val_msg  = _post_write_validate(vm, path, content)
-                print(f"{CLI_CYAN}{val_msg}{CLI_CLR}")
-                # Append validation result into tool response so agent sees it
-                result = result + "\n" + val_msg
+                path    = tool_args.get("path", "")
+                content = tool_args.get("content", "")
+                val_msg = _post_write_validate(vm, path, content)
+                print(f"  {CLI_CYAN}{val_msg}{CLI_CLR}")
+                result  = result + "\n" + val_msg
+
+            # ── Show full tool output ─────────────────────────────────────────
+            log_tool_output(result)
 
             # ── Track grounding refs ───────────────────────────────────────────
             if tool_name == "read":
@@ -771,7 +863,7 @@ def run_agent(
             _submit_answer("Exceeded 40 steps.", Outcome.OUTCOME_ERR_INTERNAL, grounding_refs)
 
     except Exception as exc:
-        print(f"{CLI_RED}EXCEPTION: {exc}{CLI_CLR}")
+        log_error("EXCEPTION", str(exc))
         import traceback; traceback.print_exc()
         _submit_answer(f"Unhandled exception: {exc}", Outcome.OUTCOME_ERR_INTERNAL, [])
 

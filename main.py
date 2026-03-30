@@ -32,7 +32,7 @@ from bitgn.harness_pb2 import (
 )
 from connectrpc.errors import ConnectError
 
-from agent import run_agent
+from agent import run_agent, log_header, CLI_GREEN, CLI_RED, CLI_CLR, CLI_YELLOW, CLI_CYAN, CLI_BLUE
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -48,13 +48,6 @@ CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
 # Модель для анализатора/версионера (если не Cerebras — та же что и агент)
 ANALYZER_MODEL = os.getenv("ANALYZER_MODEL") or MODEL_ID
-
-CLI_RED    = "\x1B[31m"
-CLI_GREEN  = "\x1B[32m"
-CLI_CLR    = "\x1B[0m"
-CLI_BLUE   = "\x1B[34m"
-CLI_YELLOW = "\x1B[33m"
-CLI_CYAN   = "\x1B[36m"
 
 _print_lock = threading.Lock()
 
@@ -200,12 +193,10 @@ def run_task(
     lessons: list[str],
     current_hint: str,
 ) -> tuple[str, float, list[str], str, list[dict]] | None:
-    safe_print(f"{'=' * 30} Task: {task.task_id} {'=' * 30}")
-
     trial = client.start_playground(
         StartPlaygroundRequest(benchmark_id=BENCHMARK_ID, task_id=task.task_id)
     )
-    safe_print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 60}")
+    log_header(task.task_id, trial.instruction)
 
     # Preflight: fetch wiki (cached per harness_url)
     url = trial.harness_url
@@ -229,9 +220,12 @@ def run_task(
     score_detail = list(result.score_detail) if result.score_detail else []
 
     if result.score >= 0:
-        style   = CLI_GREEN if result.score == 1 else CLI_RED
-        explain = textwrap.indent("\n".join(score_detail), "  ") if score_detail else ""
-        safe_print(f"\n{style}Score: {result.score:0.2f}{CLI_CLR}" + (f"\n{explain}" if explain else ""))
+        style  = CLI_GREEN if result.score == 1.0 else CLI_RED
+        symbol = "✓" if result.score == 1.0 else "✗"
+        safe_print(f"\n{style}  {symbol} Score: {result.score:0.2f}  [{task.task_id}]{CLI_CLR}")
+        if score_detail:
+            for line in score_detail:
+                safe_print(f"    {CLI_YELLOW}{line}{CLI_CLR}")
         return task.task_id, result.score, score_detail, trial.instruction, action_log
 
     return None
