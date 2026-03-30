@@ -73,19 +73,39 @@ def _analyzer_model() -> str:
 
 def fetch_wiki(harness_url: str) -> str:
     """
-    Читает /AGENTS.md из workspace один раз перед задачей.
-    Результат инжектируется в system prompt агента.
+    Читает ВСЕ AGENTS.md из workspace — root и вложенные.
+    Формирует многоуровневый контекст для system prompt.
+
+    Иерархия: /AGENTS.md (глобальные правила) + /subdir/AGENTS.md (локальные уточнения).
+    Nested AGENTS.md имеют более высокий приоритет для файлов своей директории.
     """
+    from bitgn.vm.pcm_pb2 import FindRequest
+    vm = PcmRuntimeClientSync(harness_url)
+    sections: list[str] = []
+
     try:
-        vm = PcmRuntimeClientSync(harness_url)
-        r  = vm.read(ReadRequest(path="/AGENTS.md"))
-        content = r.content.strip()
-        if content:
-            safe_print(f"{CLI_CYAN}[wiki] fetched /AGENTS.md ({len(content)} chars){CLI_CLR}")
-        return content
+        # Найти все AGENTS.md файлы в воркспейсе
+        r = vm.find(FindRequest(root="/", name="AGENTS.md", type=1, limit=20))
+        paths = sorted(r.items)  # сортировка: root сначала (/, потом /subdir/)
     except ConnectError as exc:
-        safe_print(f"{CLI_YELLOW}[wiki] /AGENTS.md not found: {exc.message}{CLI_CLR}")
-        return ""
+        safe_print(f"{CLI_YELLOW}[wiki] find AGENTS.md failed: {exc.message}{CLI_CLR}")
+        paths = ["/AGENTS.md"]
+
+    if not paths:
+        paths = ["/AGENTS.md"]
+
+    for path in paths:
+        try:
+            content = vm.read(ReadRequest(path=path)).content.strip()
+            if content:
+                depth = path.count("/") - 1  # 0 = root, 1 = subdir, etc.
+                label = "Global rules" if depth == 0 else f"Local rules for {path.rsplit('/', 1)[0]}/"
+                sections.append(f"### {label} ({path})\n{content}")
+                safe_print(f"{CLI_CYAN}[wiki] {path} ({len(content)} chars){CLI_CLR}")
+        except ConnectError as exc:
+            safe_print(f"{CLI_YELLOW}[wiki] {path} not found: {exc.message}{CLI_CLR}")
+
+    return "\n\n".join(sections)
 
 
 # ─── Analyzer: extract lesson from failure ─────────────────────────────────────
