@@ -269,7 +269,9 @@ def main() -> None:
     raw_lessons:   list[str] = []   # сырые уроки от Analyzer
     current_hint:  str       = ""   # эволюционирующий hint от Versioner
     wiki_cache:    dict      = {}   # кэш AGENTS.md per harness_url
-    VERSIONER_EVERY = 3             # запускать Versioner каждые N новых уроков
+    # Versioner отключён: gpt-oss:20b галлюцинирует несуществующие типы действий.
+    # Включить когда будет более мощная модель (gpt-oss:120b / cerebras).
+    VERSIONER_EVERY = 999
 
     # OpenAI base URL setup for Ollama
     if not os.getenv("OPENAI_BASE_URL") and os.getenv("OLLAMA_BASE_URL"):
