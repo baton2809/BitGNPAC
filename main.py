@@ -1,15 +1,17 @@
 """
-BitGN PAC1 — главный цикл с self-evolving архитектурой.
+BitGN PAC1 — главный цикл.
 
-Self-evolving: после каждой провальной задачи LLM-анализатор извлекает урок
-о формате/пути/логике и передаёт его в extra_hint для следующих задач.
+Архитектура Main → Analyzer → Versioner (как у победителей ERC3):
+  - После каждого провала: Analyzer извлекает урок
+  - Каждые 3 урока: Versioner переписывает их в компактные правила
+  - Правила передаются в extra_hint для следующих задач
 
-Модели:
-  gpt-oss:20b / gpt-oss:120b   — через Ollama (OLLAMA_BASE_URL)
-  llama3.3-70b                 — через Cerebras (CEREBRAS_API_KEY)
-  gpt-4o / claude-...          — через стандартный OPENAI_API_KEY
+Дополнительно:
+  - Preflight wiki fetch: AGENTS.md читается один раз и инжектируется в system prompt
+  - Cerebras API: CEREBRAS_API_KEY → llama-3.3-70b @ 3k tok/sec (бесплатно)
 """
 
+import json
 import os
 import sys
 import textwrap
@@ -19,6 +21,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 from bitgn.harness_connect import HarnessServiceClientSync
+from bitgn.vm.pcm_connect import PcmRuntimeClientSync
+from bitgn.vm.pcm_pb2 import ReadRequest
 from bitgn.harness_pb2 import (
     EndTrialRequest,
     EvalPolicy,
@@ -32,18 +36,17 @@ from agent import run_agent
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
-BITGN_URL      = os.getenv("BENCHMARK_HOST")    or "https://api.bitgn.com"
-BENCHMARK_ID   = os.getenv("BENCHMARK_ID")      or "bitgn/pac1-dev"
-MODEL_ID       = os.getenv("MODEL_ID")          or "gpt-oss:20b"
+BITGN_URL      = os.getenv("BENCHMARK_HOST")     or "https://api.bitgn.com"
+BENCHMARK_ID   = os.getenv("BENCHMARK_ID")       or "bitgn/pac1-dev"
+MODEL_ID       = os.getenv("MODEL_ID")           or "gpt-oss:20b"
 PARALLEL_TASKS = int(os.getenv("PARALLEL_TASKS") or "1")
 
-# Cerebras: set CEREBRAS_API_KEY to use llama3.3-70b for free at 3k tok/sec
+# Cerebras: задайте CEREBRAS_API_KEY для использования llama-3.3-70b в analyzer/versioner
 CEREBRAS_API_KEY  = os.getenv("CEREBRAS_API_KEY")
-CEREBRAS_MODEL    = os.getenv("CEREBRAS_MODEL") or "llama-3.3-70b"
+CEREBRAS_MODEL    = os.getenv("CEREBRAS_MODEL")  or "llama-3.3-70b"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
-# Analyzer model: cheaper/faster model for post-task lesson extraction
-# Falls back to same MODEL_ID if not set
+# Модель для анализатора/версионера (если не Cerebras — та же что и агент)
 ANALYZER_MODEL = os.getenv("ANALYZER_MODEL") or MODEL_ID
 
 CLI_RED    = "\x1B[31m"
@@ -51,6 +54,7 @@ CLI_GREEN  = "\x1B[32m"
 CLI_CLR    = "\x1B[0m"
 CLI_BLUE   = "\x1B[34m"
 CLI_YELLOW = "\x1B[33m"
+CLI_CYAN   = "\x1B[36m"
 
 _print_lock = threading.Lock()
 
@@ -60,13 +64,44 @@ def safe_print(*args, **kwargs):
         print(*args, **kwargs)
 
 
-# ─── Self-evolving: lesson extraction ──────────────────────────────────────────
+# ─── Analyzer/Versioner clients ────────────────────────────────────────────────
 
 def _make_analyzer_client() -> OpenAI:
-    """Return OpenAI client for the analyzer (Cerebras if key set, else default)."""
     if CEREBRAS_API_KEY:
         return OpenAI(api_key=CEREBRAS_API_KEY, base_url=CEREBRAS_BASE_URL)
     return OpenAI()
+
+
+def _analyzer_model() -> str:
+    return CEREBRAS_MODEL if CEREBRAS_API_KEY else ANALYZER_MODEL
+
+
+# ─── Preflight wiki fetch ──────────────────────────────────────────────────────
+
+def fetch_wiki(harness_url: str) -> str:
+    """
+    Читает /AGENTS.md из workspace один раз перед задачей.
+    Результат инжектируется в system prompt агента.
+    """
+    try:
+        vm = PcmRuntimeClientSync(harness_url)
+        r  = vm.read(ReadRequest(path="/AGENTS.md"))
+        content = r.content.strip()
+        if content:
+            safe_print(f"{CLI_CYAN}[wiki] fetched /AGENTS.md ({len(content)} chars){CLI_CLR}")
+        return content
+    except ConnectError as exc:
+        safe_print(f"{CLI_YELLOW}[wiki] /AGENTS.md not found: {exc.message}{CLI_CLR}")
+        return ""
+
+
+# ─── Analyzer: extract lesson from failure ─────────────────────────────────────
+
+def _json_short(d: dict) -> str:
+    try:
+        return json.dumps(d)[:80]
+    except Exception:
+        return str(d)[:80]
 
 
 def extract_lesson(
@@ -77,54 +112,82 @@ def extract_lesson(
     score_detail: list[str],
 ) -> str | None:
     """
-    Ask LLM to extract ONE specific actionable lesson from a failed task.
-    Returns a short string like:
-      "outbox JSON needs fields: id, to, subject, body, date — read existing file first"
-    Returns None if score == 1 or extraction fails.
+    Analyzer: после провала задачи извлекает один конкретный урок.
+    Возвращает строку ≤2 предложений или None.
     """
     if score >= 1.0:
         return None
 
-    # Build a compact summary of what the agent did
     steps_summary = "\n".join(
-        f"  {s['tool']}({json_short(s['args'])}) → {s['result'][:100]}"
-        for s in action_log[-10:]  # last 10 actions
+        f"  {s['tool']}({_json_short(s['args'])}) → {s['result'][:120]}"
+        for s in action_log[-12:]
     ) or "  (no actions logged)"
 
-    detail_text = "\n".join(score_detail) if score_detail else "(no score detail available)"
+    detail_text = "\n".join(score_detail) if score_detail else "(no detail)"
 
     prompt = (
-        "A PKM agent failed a task (score=0). "
+        "A PKM file-management agent scored 0 on a task. "
         "Extract ONE specific actionable lesson about what went wrong — "
-        "focus on file format, field names, paths, or logic. "
-        "Be concrete, ≤2 sentences.\n\n"
-        f"Task: {task_instruction[:300]}\n\n"
-        f"Last actions:\n{steps_summary}\n\n"
-        f"Score detail:\n{detail_text}\n\n"
-        "Lesson (e.g. 'outbox JSON must include field X; read existing file first'):"
+        "focus on file format, exact field names, file paths, or logic error. "
+        "Be concrete, ≤2 sentences. No intro, just the lesson.\n\n"
+        f"Task: {task_instruction[:400]}\n\n"
+        f"Last agent actions:\n{steps_summary}\n\n"
+        f"Score detail from harness:\n{detail_text}\n\n"
+        "Lesson:"
     )
 
     try:
         resp = analyzer.chat.completions.create(
-            model=CEREBRAS_MODEL if CEREBRAS_API_KEY else ANALYZER_MODEL,
+            model=_analyzer_model(),
             messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=120,
+            max_completion_tokens=150,
         )
         lesson = (resp.choices[0].message.content or "").strip()
         if lesson:
-            safe_print(f"{CLI_YELLOW}[analyzer] lesson: {lesson}{CLI_CLR}")
+            safe_print(f"{CLI_YELLOW}[analyzer] {lesson}{CLI_CLR}")
         return lesson or None
     except Exception as exc:
         safe_print(f"{CLI_YELLOW}[analyzer] failed: {exc}{CLI_CLR}")
         return None
 
 
-def json_short(d: dict) -> str:
-    """Compact JSON repr for logging."""
+# ─── Versioner: rewrite lessons into clean rules ───────────────────────────────
+
+def run_versioner(
+    analyzer: OpenAI,
+    raw_lessons: list[str],
+    current_hint: str,
+) -> str:
+    """
+    Versioner: раз в N уроков переписывает накопленные знания в компактные правила.
+    Это то что у победителей эволюционировало 80 поколений.
+    """
+    lessons_text = "\n".join(f"- {l}" for l in raw_lessons)
+
+    prompt = (
+        "You are a Versioner for a PKM file-management agent. "
+        "Below are raw lessons from failed tasks and the current hint. "
+        "Rewrite them into a compact, numbered list of rules (≤10 rules, ≤1 sentence each). "
+        "Remove duplicates. Keep only actionable rules about file format, paths, and logic.\n\n"
+        f"Current hint:\n{current_hint or '(none)'}\n\n"
+        f"New raw lessons:\n{lessons_text}\n\n"
+        "Output: numbered rules only, no intro text."
+    )
+
     try:
-        return __import__("json").dumps(d)[:80]
-    except Exception:
-        return str(d)[:80]
+        resp = analyzer.chat.completions.create(
+            model=_analyzer_model(),
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=300,
+        )
+        new_hint = (resp.choices[0].message.content or "").strip()
+        if new_hint:
+            safe_print(f"{CLI_CYAN}[versioner] evolved hint ({len(raw_lessons)} lessons → {len(new_hint)} chars):{CLI_CLR}")
+            safe_print(f"{CLI_CYAN}{new_hint}{CLI_CLR}")
+        return new_hint or current_hint
+    except Exception as exc:
+        safe_print(f"{CLI_YELLOW}[versioner] failed: {exc} — keeping current hint{CLI_CLR}")
+        return current_hint
 
 
 # ─── Task runner ───────────────────────────────────────────────────────────────
@@ -133,34 +196,36 @@ def run_task(
     client: HarnessServiceClientSync,
     task,
     analyzer: OpenAI,
+    wiki_cache: dict,
     lessons: list[str],
+    current_hint: str,
 ) -> tuple[str, float, list[str], str, list[dict]] | None:
-    """
-    Run one task in playground mode.
-    Returns (task_id, score, score_detail, instruction, action_log) or None.
-    """
     safe_print(f"{'=' * 30} Task: {task.task_id} {'=' * 30}")
 
     trial = client.start_playground(
-        StartPlaygroundRequest(
-            benchmark_id=BENCHMARK_ID,
-            task_id=task.task_id,
-        )
+        StartPlaygroundRequest(benchmark_id=BENCHMARK_ID, task_id=task.task_id)
     )
     safe_print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 60}")
 
-    # Build extra_hint from accumulated lessons
-    extra_hint = ""
-    if lessons:
-        extra_hint = "\n".join(f"- {l}" for l in lessons[-8:])  # last 8 lessons
+    # Preflight: fetch wiki (cached per harness_url)
+    url = trial.harness_url
+    if url not in wiki_cache:
+        wiki_cache[url] = fetch_wiki(url)
+    wiki_content = wiki_cache[url]
 
     action_log = []
     try:
-        action_log = run_agent(MODEL_ID, trial.harness_url, trial.instruction, extra_hint)
+        action_log = run_agent(
+            MODEL_ID,
+            url,
+            trial.instruction,
+            wiki_content=wiki_content,
+            extra_hint=current_hint,
+        )
     except Exception as exc:
         safe_print(f"{CLI_RED}run_agent exception: {exc}{CLI_CLR}")
 
-    result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
+    result     = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
     score_detail = list(result.score_detail) if result.score_detail else []
 
     if result.score >= 0:
@@ -168,6 +233,7 @@ def run_task(
         explain = textwrap.indent("\n".join(score_detail), "  ") if score_detail else ""
         safe_print(f"\n{style}Score: {result.score:0.2f}{CLI_CLR}" + (f"\n{explain}" if explain else ""))
         return task.task_id, result.score, score_detail, trial.instruction, action_log
+
     return None
 
 
@@ -176,28 +242,33 @@ def run_task(
 def main() -> None:
     task_filter = sys.argv[1:]
     scores: list[tuple[str, float]] = []
-    lessons: list[str] = []  # accumulated lessons for self-evolving hint
 
-    # Set up OpenAI base URL for Ollama if needed
-    if os.getenv("OPENAI_BASE_URL") is None and os.getenv("OLLAMA_BASE_URL"):
+    # Self-evolving state
+    raw_lessons:   list[str] = []   # сырые уроки от Analyzer
+    current_hint:  str       = ""   # эволюционирующий hint от Versioner
+    wiki_cache:    dict      = {}   # кэш AGENTS.md per harness_url
+    VERSIONER_EVERY = 3             # запускать Versioner каждые N новых уроков
+
+    # OpenAI base URL setup for Ollama
+    if not os.getenv("OPENAI_BASE_URL") and os.getenv("OLLAMA_BASE_URL"):
         os.environ["OPENAI_BASE_URL"] = os.environ["OLLAMA_BASE_URL"].rstrip("/") + "/v1"
-    if os.getenv("OPENAI_API_KEY") is None:
+    if not os.getenv("OPENAI_API_KEY"):
         os.environ["OPENAI_API_KEY"] = "ollama"
 
     analyzer = _make_analyzer_client()
 
     try:
         harness = HarnessServiceClientSync(BITGN_URL)
-        print(f"BitGN status: {harness.status(StatusRequest())}")
+        print(f"BitGN: {harness.status(StatusRequest())}")
 
         res = harness.get_benchmark(GetBenchmarkRequest(benchmark_id=BENCHMARK_ID))
         print(
             f"{EvalPolicy.Name(res.policy)} benchmark: {res.benchmark_id} "
-            f"with {len(res.tasks)} tasks.\n{CLI_GREEN}{res.description}{CLI_CLR}"
+            f"({len(res.tasks)} tasks)\n{CLI_GREEN}{res.description}{CLI_CLR}"
         )
         model_info = f"model={MODEL_ID}"
         if CEREBRAS_API_KEY:
-            model_info += f" | analyzer=cerebras/{CEREBRAS_MODEL}"
+            model_info += f" | analyzer+versioner=cerebras/{CEREBRAS_MODEL}"
         print(f"{model_info} | parallel={PARALLEL_TASKS}\n")
 
         tasks_to_run = [
@@ -206,55 +277,61 @@ def main() -> None:
         ]
 
         if PARALLEL_TASKS > 1:
-            # Parallel mode: no self-evolving (lessons can't flow between concurrent tasks)
-            print(f"Running {len(tasks_to_run)} tasks with PARALLEL_TASKS={PARALLEL_TASKS}")
+            # Параллельный режим: без self-evolving (уроки не могут перетекать между параллельными задачами)
+            print(f"Parallel mode: {len(tasks_to_run)} tasks × {PARALLEL_TASKS} workers")
             with ThreadPoolExecutor(max_workers=PARALLEL_TASKS) as executor:
                 futures = {
-                    executor.submit(run_task, harness, task, analyzer, []): task
+                    executor.submit(run_task, harness, task, analyzer, {}, [], ""): task
                     for task in tasks_to_run
                 }
                 for future in as_completed(futures):
                     try:
-                        result = future.result()
-                        if result:
-                            task_id, score, _, _, _ = result
-                            scores.append((task_id, score))
+                        r = future.result()
+                        if r:
+                            scores.append((r[0], r[1]))
                     except Exception as exc:
                         safe_print(f"Task error: {exc}")
         else:
-            # Sequential mode: self-evolving lessons flow between tasks
+            # Последовательный режим: Main → Analyzer → Versioner
             for task in tasks_to_run:
-                result = run_task(harness, task, analyzer, lessons)
-                if result is None:
+                r = run_task(harness, task, analyzer, wiki_cache, raw_lessons, current_hint)
+                if r is None:
                     continue
-                task_id, score, score_detail, instruction, action_log = result
+
+                task_id, score, score_detail, instruction, action_log = r
                 scores.append((task_id, score))
 
-                # Self-evolving: extract lesson from failures
+                # ── Analyzer: извлечь урок из провала ───────────────────────
                 if score < 1.0:
-                    lesson = extract_lesson(analyzer, instruction, action_log, score, score_detail)
+                    lesson = extract_lesson(
+                        analyzer, instruction, action_log, score, score_detail
+                    )
                     if lesson:
-                        lessons.append(lesson)
-                        print(f"{CLI_YELLOW}[{len(lessons)} lessons accumulated]{CLI_CLR}")
+                        raw_lessons.append(lesson)
+                        print(f"{CLI_YELLOW}[{len(raw_lessons)} lessons]{CLI_CLR}")
+
+                        # ── Versioner: переписать уроки в правила ────────────
+                        if len(raw_lessons) % VERSIONER_EVERY == 0:
+                            print(f"{CLI_CYAN}[versioner] running...{CLI_CLR}")
+                            current_hint = run_versioner(analyzer, raw_lessons, current_hint)
 
     except ConnectError as exc:
         print(f"{CLI_RED}{exc.code}: {exc.message}{CLI_CLR}")
     except KeyboardInterrupt:
         print(f"{CLI_RED}Interrupted{CLI_CLR}")
 
-    # Final summary
+    # ── Итоги ───────────────────────────────────────────────────────────────
     if scores:
         print("\n" + "=" * 50)
         for task_id, score in scores:
-            style = CLI_GREEN if score == 1 else CLI_RED
+            style = CLI_GREEN if score == 1.0 else CLI_RED
             print(f"  {task_id}: {style}{score:0.2f}{CLI_CLR}")
-        total = sum(s for _, s in scores) / len(scores) * 100.0
-        print(f"\nFINAL: {total:0.2f}% ({sum(s==1.0 for _,s in scores)}/{len(scores)} tasks)")
+        passed = sum(1 for _, s in scores if s == 1.0)
+        total  = sum(s for _, s in scores) / len(scores) * 100.0
+        print(f"\nFINAL: {total:.2f}% ({passed}/{len(scores)} tasks)")
 
-    if lessons:
-        print(f"\n{CLI_YELLOW}Accumulated lessons this session:{CLI_CLR}")
-        for i, l in enumerate(lessons, 1):
-            print(f"  {i}. {l}")
+    if current_hint:
+        print(f"\n{CLI_CYAN}Final evolved hint:{CLI_CLR}\n{current_hint}")
 
 
 if __name__ == "__main__":
