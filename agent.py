@@ -68,15 +68,11 @@ def log_bootstrap(name: str, result: str) -> None:
         print(f"  {line}")
 
 
-def log_step_header(step: int, total: int, reasoning: str) -> None:
+def log_step_header(step: int, total: int, tok_info: str = "") -> None:
     print(f"\n{_sep('─')}")
     label = f"Next step_{step}..."
-    if reasoning:
-        # Trim reasoning to first 120 chars for readability
-        short = reasoning.replace("\n", " ").strip()[:120]
-        print(f"{CLI_BOLD}{label}{CLI_CLR} {CLI_DIM}{short}{CLI_CLR}")
-    else:
-        print(f"{CLI_BOLD}{label}{CLI_CLR}")
+    suffix = f"  {CLI_DIM}[{tok_info}]{CLI_CLR}" if tok_info else ""
+    print(f"{CLI_BOLD}{label}{CLI_CLR}{suffix}")
 
 
 def log_tool_call(name: str, args: dict, elapsed_ms: int) -> None:
@@ -758,6 +754,15 @@ def run_agent(
             started = time.time()
 
             # ── LLM call with retry ──────────────────────────────────────────
+            # THINK_LEVEL env: "low" | "medium" | "high" | "highest" | "" (off)
+            # gpt-oss:20b natively supports reasoning via Ollama think parameter.
+            # Default in model template is "medium" even without setting it.
+            # Setting "high" gives more thorough reasoning at cost of more tokens.
+            think_level = os.environ.get("THINK_LEVEL", "high")
+            extra: dict = {}
+            if think_level:
+                extra["extra_body"] = {"think": True, "options": {"think_level": think_level}}
+
             for _attempt in range(3):
                 try:
                     resp = client.chat.completions.create(
@@ -766,6 +771,7 @@ def run_agent(
                         tools=TOOLS,
                         tool_choice="auto",
                         max_completion_tokens=4096,
+                        **extra,
                     )
                     break
                 except (APIStatusError, APIConnectionError) as _api_err:
@@ -786,23 +792,44 @@ def run_agent(
             if resp.usage:
                 total_prompt_tok += resp.usage.prompt_tokens or 0
                 total_compl_tok  += resp.usage.completion_tokens or 0
-                tok_info = f"  {CLI_DIM}[+{resp.usage.prompt_tokens}p/{resp.usage.completion_tokens}c tok]{CLI_CLR}"
+                tok_info = f"+{resp.usage.prompt_tokens}p/{resp.usage.completion_tokens}c tok"
             else:
                 tok_info = ""
 
-            # Show model reasoning/content text if present
-            reasoning = (msg.content or "").strip()
-            log_step_header(i + 1, 40, reasoning)
-            if tok_info:
-                print(tok_info, end="")
+            # ── Extract thinking (Ollama returns it in msg.thinking or inside content) ──
+            # Ollama 0.7+: message has a .thinking field with the analysis channel content
+            thinking_text = ""
+            raw_content   = msg.content or ""
+
+            # Try dedicated .thinking attribute first (Ollama OpenAI-compat >= 0.7)
+            thinking_attr = getattr(msg, "thinking", None)
+            if thinking_attr:
+                thinking_text = thinking_attr.strip()
+            elif raw_content.startswith("<think>"):
+                # Fallback: thinking embedded in content as <think>...</think>
+                end = raw_content.find("</think>")
+                if end != -1:
+                    thinking_text = raw_content[7:end].strip()
+                    raw_content   = raw_content[end + 8:].strip()
+
+            # Step header: show step number + tok info
+            log_step_header(i + 1, 40, tok_info)
+
+            # Show thinking block if present
+            if thinking_text:
+                print(f"  {CLI_DIM}[thinking]{CLI_CLR}")
+                for line in thinking_text.splitlines():
+                    print(f"    {CLI_DIM}{line}{CLI_CLR}")
+
+            # Show any remaining content text
+            if raw_content.strip() and not msg.tool_calls:
+                print(f"  {CLI_DIM}[text]{CLI_CLR} {raw_content[:200]}")
 
             # ── No tool call ─────────────────────────────────────────────────
             if not msg.tool_calls:
                 log_warn(f"No tool call (finish={finish}). Agent stopped.")
-                if reasoning:
-                    log_tool_output(reasoning, prefix="MODEL TEXT")
                 _submit_answer(
-                    f"Agent stopped without report_completion (finish={finish}): {reasoning[:300]}",
+                    f"Agent stopped without report_completion (finish={finish}): {raw_content[:300]}",
                     Outcome.OUTCOME_ERR_INTERNAL,
                     grounding_refs,
                 )
