@@ -212,7 +212,7 @@ def run_task(
     wiki_cache: dict,
     lessons: list[str],
     current_hint: str,
-) -> tuple[str, float, list[str], str, list[dict]] | None:
+) -> tuple | None:
     trial = client.start_playground(
         StartPlaygroundRequest(benchmark_id=BENCHMARK_ID, task_id=task.task_id)
     )
@@ -224,9 +224,10 @@ def run_task(
         wiki_cache[url] = fetch_wiki(url)
     wiki_content = wiki_cache[url]
 
-    action_log = []
+    action_log: list[dict] = []
+    stats: dict = {}
     try:
-        action_log = run_agent(
+        action_log, stats = run_agent(
             MODEL_ID,
             url,
             trial.instruction,
@@ -236,17 +237,23 @@ def run_task(
     except Exception as exc:
         safe_print(f"{CLI_RED}run_agent exception: {exc}{CLI_CLR}")
 
-    result     = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
+    result       = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
     score_detail = list(result.score_detail) if result.score_detail else []
 
     if result.score >= 0:
-        style  = CLI_GREEN if result.score == 1.0 else CLI_RED
-        symbol = "✓" if result.score == 1.0 else "✗"
-        safe_print(f"\n{style}  {symbol} Score: {result.score:0.2f}  [{task.task_id}]{CLI_CLR}")
+        style    = CLI_GREEN if result.score == 1.0 else CLI_RED
+        symbol   = "✓" if result.score == 1.0 else "✗"
+        elapsed  = stats.get("elapsed_s", 0.0)
+        tok      = stats.get("total_tok", 0)
+        calls    = stats.get("llm_calls", 0)
+        safe_print(
+            f"\n{style}  {symbol} Score: {result.score:0.2f}  [{task.task_id}]"
+            f"  {elapsed:.1f}s  {tok} tok  {calls} LLM calls{CLI_CLR}"
+        )
         if score_detail:
             for line in score_detail:
                 safe_print(f"    {CLI_YELLOW}{line}{CLI_CLR}")
-        return task.task_id, result.score, score_detail, trial.instruction, action_log
+        return task.task_id, result.score, score_detail, trial.instruction, action_log, stats
 
     return None
 
@@ -256,6 +263,7 @@ def run_task(
 def main() -> None:
     task_filter = sys.argv[1:]
     scores: list[tuple[str, float]] = []
+    all_stats: list[tuple[str, float, dict]] = []  # (task_id, score, stats)
 
     # Self-evolving state
     raw_lessons:   list[str] = []   # сырые уроки от Analyzer
@@ -291,7 +299,7 @@ def main() -> None:
         ]
 
         if PARALLEL_TASKS > 1:
-            # Параллельный режим: без self-evolving (уроки не могут перетекать между параллельными задачами)
+            # Параллельный режим: без self-evolving
             print(f"Parallel mode: {len(tasks_to_run)} tasks × {PARALLEL_TASKS} workers")
             with ThreadPoolExecutor(max_workers=PARALLEL_TASKS) as executor:
                 futures = {
@@ -303,6 +311,7 @@ def main() -> None:
                         r = future.result()
                         if r:
                             scores.append((r[0], r[1]))
+                            all_stats.append((r[0], r[1], r[5]))
                     except Exception as exc:
                         safe_print(f"Task error: {exc}")
         else:
@@ -312,8 +321,9 @@ def main() -> None:
                 if r is None:
                     continue
 
-                task_id, score, score_detail, instruction, action_log = r
+                task_id, score, score_detail, instruction, action_log, stats = r
                 scores.append((task_id, score))
+                all_stats.append((task_id, score, stats))
 
                 # ── Analyzer: извлечь урок из провала ───────────────────────
                 if score < 1.0:
@@ -334,15 +344,37 @@ def main() -> None:
     except KeyboardInterrupt:
         print(f"{CLI_RED}Interrupted{CLI_CLR}")
 
-    # ── Итоги ───────────────────────────────────────────────────────────────
-    if scores:
-        print("\n" + "=" * 50)
-        for task_id, score in scores:
-            style = CLI_GREEN if score == 1.0 else CLI_RED
-            print(f"  {task_id}: {style}{score:0.2f}{CLI_CLR}")
-        passed = sum(1 for _, s in scores if s == 1.0)
-        total  = sum(s for _, s in scores) / len(scores) * 100.0
-        print(f"\nFINAL: {total:.2f}% ({passed}/{len(scores)} tasks)")
+    # ── Итоговая таблица ─────────────────────────────────────────────────────
+    if all_stats:
+        print(f"\n{'=' * 72}")
+        print(f"  {'Task':<6}  {'Score':>5}  {'Time':>8}  {'Tokens':>7}  {'Calls':>5}")
+        print(f"  {'-'*6}  {'-'*5}  {'-'*8}  {'-'*7}  {'-'*5}")
+        total_time = 0.0
+        total_tok  = 0
+        total_call = 0
+        for task_id, score, st in all_stats:
+            style  = CLI_GREEN if score == 1.0 else CLI_RED
+            symbol = "✓" if score == 1.0 else "✗"
+            t = st.get("elapsed_s", 0.0)
+            k = st.get("total_tok", 0)
+            c = st.get("llm_calls", 0)
+            total_time += t
+            total_tok  += k
+            total_call += c
+            print(
+                f"  {style}{symbol} {task_id:<5}  {score:>5.2f}  {t:>7.1f}s"
+                f"  {k:>7}  {c:>5}{CLI_CLR}"
+            )
+        print(f"  {'─'*6}  {'─'*5}  {'─'*8}  {'─'*7}  {'─'*5}")
+        passed = sum(1 for _, s, _ in all_stats if s == 1.0)
+        avg    = sum(s for _, s, _ in all_stats) / len(all_stats) * 100.0
+        print(
+            f"  {'TOTAL':<6}  {avg/100:>5.2f}  {total_time:>7.1f}s"
+            f"  {total_tok:>7}  {total_call:>5}"
+        )
+        print(f"{'=' * 72}")
+        print(f"\n  FINAL: {avg:.2f}%  ({passed}/{len(all_stats)} tasks)")
+        print(f"  Avg per task: {total_time/len(all_stats):.1f}s, {total_tok//len(all_stats)} tok")
 
     if current_hint:
         print(f"\n{CLI_CYAN}Final evolved hint:{CLI_CLR}\n{current_hint}")

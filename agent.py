@@ -678,11 +678,37 @@ def run_agent(
     action_log: list[dict] = []
     verify_done_called = False
 
+    # ── Stats tracking ───────────────────────────────────────────────────────
+    task_start_time   = time.time()
+    total_prompt_tok  = 0
+    total_compl_tok   = 0
+    llm_calls         = 0
+
+    def _get_stats() -> dict:
+        elapsed = time.time() - task_start_time
+        return {
+            "elapsed_s":    round(elapsed, 1),
+            "llm_calls":    llm_calls,
+            "prompt_tok":   total_prompt_tok,
+            "compl_tok":    total_compl_tok,
+            "total_tok":    total_prompt_tok + total_compl_tok,
+        }
+
+    def _print_stats() -> None:
+        elapsed = time.time() - task_start_time
+        total_tok = total_prompt_tok + total_compl_tok
+        print(
+            f"\n  {CLI_DIM}Stats: {elapsed:.1f}s | "
+            f"{llm_calls} LLM calls | "
+            f"{total_prompt_tok}p + {total_compl_tok}c = {total_tok} tokens{CLI_CLR}"
+        )
+
     def _submit_answer(message: str, outcome: Outcome, refs: list[str]) -> None:
         nonlocal answer_called
         if answer_called:
             return
         answer_called = True
+        _print_stats()
         vm.answer(AnswerRequest(
             message=message,
             outcome=outcome,
@@ -748,16 +774,27 @@ def run_agent(
                     time.sleep(wait)
             else:
                 _submit_answer("LLM API failed after 3 retries.", Outcome.OUTCOME_ERR_INTERNAL, grounding_refs)
-                return action_log
+                return action_log, _get_stats()
 
             elapsed_ms = int((time.time() - started) * 1000)
             msg    = resp.choices[0].message
             finish = resp.choices[0].finish_reason
             log.append(msg.model_dump(exclude_unset=False))
 
+            # ── Count tokens ─────────────────────────────────────────────────
+            llm_calls += 1
+            if resp.usage:
+                total_prompt_tok += resp.usage.prompt_tokens or 0
+                total_compl_tok  += resp.usage.completion_tokens or 0
+                tok_info = f"  {CLI_DIM}[+{resp.usage.prompt_tokens}p/{resp.usage.completion_tokens}c tok]{CLI_CLR}"
+            else:
+                tok_info = ""
+
             # Show model reasoning/content text if present
             reasoning = (msg.content or "").strip()
             log_step_header(i + 1, 40, reasoning)
+            if tok_info:
+                print(tok_info, end="")
 
             # ── No tool call ─────────────────────────────────────────────────
             if not msg.tool_calls:
@@ -824,13 +861,13 @@ def run_agent(
                     OUTCOME_BY_NAME.get(outcome, Outcome.OUTCOME_ERR_INTERNAL),
                     refs,
                 )
-                return action_log
+                return action_log, _get_stats()
 
             # ── Stagnation ────────────────────────────────────────────────────
             if stagnation.check(tool_name, tool_args):
                 log_stagnation()
                 _submit_answer("Stagnation: same tool called repeatedly.", Outcome.OUTCOME_ERR_INTERNAL, grounding_refs)
-                return action_log
+                return action_log, _get_stats()
 
             # ── Execute ───────────────────────────────────────────────────────
             try:
@@ -857,7 +894,7 @@ def run_agent(
                     Outcome.OUTCOME_DENIED_SECURITY,
                     [tool_args.get("path", "(unknown)")],
                 )
-                return action_log
+                return action_log, _get_stats()
 
             # ── Post-write validation ─────────────────────────────────────────
             if tool_name == "write":
@@ -891,4 +928,4 @@ def run_agent(
         import traceback; traceback.print_exc()
         _submit_answer(f"Unhandled exception: {exc}", Outcome.OUTCOME_ERR_INTERNAL, [])
 
-    return action_log
+    return action_log, _get_stats()
