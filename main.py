@@ -41,6 +41,10 @@ BENCHMARK_ID   = os.getenv("BENCHMARK_ID")       or "bitgn/pac1-dev"
 MODEL_ID       = os.getenv("MODEL_ID")           or "gpt-oss:20b"
 PARALLEL_TASKS = int(os.getenv("PARALLEL_TASKS") or "1")
 
+# OpenRouter: задайте OPENROUTER_API_KEY для использования облачных моделей (напр. qwen/qwen3.6-plus-preview)
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
 # Cerebras: задайте CEREBRAS_API_KEY для использования llama-3.3-70b в analyzer/versioner
 CEREBRAS_API_KEY  = os.getenv("CEREBRAS_API_KEY")
 CEREBRAS_MODEL    = os.getenv("CEREBRAS_MODEL")  or "llama-3.3-70b"
@@ -273,8 +277,11 @@ def main() -> None:
     # Включить когда будет более мощная модель (gpt-oss:120b / cerebras).
     VERSIONER_EVERY = 999
 
-    # OpenAI base URL setup for Ollama
-    if not os.getenv("OPENAI_BASE_URL") and os.getenv("OLLAMA_BASE_URL"):
+    # OpenAI-compatible base URL setup (priority: OpenRouter > explicit OPENAI_BASE_URL > Ollama)
+    if OPENROUTER_API_KEY:
+        os.environ["OPENAI_BASE_URL"] = OPENROUTER_BASE_URL
+        os.environ["OPENAI_API_KEY"]  = OPENROUTER_API_KEY
+    elif not os.getenv("OPENAI_BASE_URL") and os.getenv("OLLAMA_BASE_URL"):
         os.environ["OPENAI_BASE_URL"] = os.environ["OLLAMA_BASE_URL"].rstrip("/") + "/v1"
     if not os.getenv("OPENAI_API_KEY"):
         os.environ["OPENAI_API_KEY"] = "ollama"
@@ -291,6 +298,8 @@ def main() -> None:
             f"({len(res.tasks)} tasks)\n{CLI_GREEN}{res.description}{CLI_CLR}"
         )
         model_info = f"model={MODEL_ID}"
+        if OPENROUTER_API_KEY:
+            model_info += " | via=openrouter"
         if CEREBRAS_API_KEY:
             model_info += f" | analyzer+versioner=cerebras/{CEREBRAS_MODEL}"
         print(f"{model_info} | parallel={PARALLEL_TASKS}\n")
