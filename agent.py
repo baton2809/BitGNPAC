@@ -587,6 +587,13 @@ always check both orderings and partial matches before giving up.
 ## Grounding refs (scored)
 grounding_refs must NEVER be empty — list every path read, created, or modified.
 
+## Focused-diff tasks — write ONLY the target file
+If the task contains phrases like "keep the diff focused", "keep changes minimal", "minimal diff",
+or "only fix [specific file]" — you MUST write ONLY to the explicitly mentioned file.
+Do NOT write any auxiliary files (plans, notes, changelogs, secondary files).
+Even if a secondary file would be helpful, writing it causes an immediate grader penalty:
+"unexpected file write '<path>'". Violating this rule results in score = 0 for the task.
+
 ## verify_done
 Call verify_done before OUTCOME_OK ONLY if you actually wrote, deleted, or created files.
 If the task required no file changes (read-only, OUTCOME_NONE_*, OUTCOME_DENIED_*) — skip it.
@@ -1176,6 +1183,29 @@ def run_agent(
                 _submit_answer("Stagnation: same tool called repeatedly.", Outcome.OUTCOME_ERR_INTERNAL, grounding_refs)
                 return action_log, _get_stats()
 
+            # ── Pre-write outbox guard (MUST run BEFORE dispatch_tool) ────────
+            if tool_name == "write":
+                _w_path = tool_args.get("path", "")
+                import re as _re
+                _is_outbox_email = bool(_re.match(r"/?outbox/\d+\.json$", _w_path))
+                _seq_read = (
+                    "outbox/seq.json" in read_paths
+                    or "/outbox/seq.json" in read_paths
+                )
+                if _is_outbox_email and not _seq_read:
+                    _guard_msg = (
+                        "BLOCKED: You attempted to write an outbox email BEFORE reading "
+                        "/outbox/seq.json. This is forbidden — writing a guessed filename "
+                        "causes an immediate score=0 (the grader records every write, even "
+                        "if you delete it later). \n"
+                        "REQUIRED ACTION: Call read('/outbox/seq.json') RIGHT NOW to get "
+                        "the correct next ID, then retry this write with the correct filename."
+                    )
+                    log_warn(f"OUTBOX GUARD: blocked write to {_w_path} — seq.json not read yet")
+                    print(f"  {CLI_YELLOW}[outbox-guard] Blocked write to {_w_path}: seq.json not read{CLI_CLR}")
+                    log.append({"role": "tool", "tool_call_id": tc.id, "content": _guard_msg})
+                    continue
+
             # ── Execute ───────────────────────────────────────────────────────
             try:
                 result = dispatch_tool(vm, tool_name, tool_args)
@@ -1207,27 +1237,6 @@ def run_agent(
             if tool_name == "write":
                 path    = tool_args.get("path", "")
                 content = tool_args.get("content", "")
-
-                # ── Guard: outbox email requires seq.json to be read first ───
-                import re as _re
-                _is_outbox_email = bool(_re.match(r"/?outbox/\d+\.json$", path))
-                _seq_read = (
-                    "outbox/seq.json" in read_paths
-                    or "/outbox/seq.json" in read_paths
-                )
-                if _is_outbox_email and not _seq_read:
-                    _guard_msg = (
-                        "BLOCKED: You attempted to write an outbox email BEFORE reading "
-                        "/outbox/seq.json. This is forbidden — writing a guessed filename "
-                        "causes an immediate score=0 (the grader records every write, even "
-                        "if you delete it later). \n"
-                        "REQUIRED ACTION: Call read('/outbox/seq.json') RIGHT NOW to get "
-                        "the correct next ID, then retry this write with the correct filename."
-                    )
-                    log_warn(f"OUTBOX GUARD: blocked write to {path} — seq.json not read yet")
-                    print(f"  {CLI_YELLOW}[outbox-guard] Blocked write to {path}: seq.json not read{CLI_CLR}")
-                    log.append({"role": "tool", "tool_call_id": tc.id, "content": _guard_msg})
-                    continue
 
                 val_msg = _post_write_validate(vm, path, content)
                 print(f"  {CLI_CYAN}{val_msg}{CLI_CLR}")
