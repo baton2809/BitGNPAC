@@ -665,6 +665,8 @@ def dispatch_tool(vm: PcmRuntimeClientSync, name: str, args: dict) -> str:
         return _format_list_response(path, r)
 
     if name == "read":
+        if "path" not in args:
+            return "Error: read() called without required 'path' argument. Retry with path='<full/path/to/file>'."
         path  = args["path"]
         start = int(args.get("start_line", 0))
         end   = int(args.get("end_line", 0))
@@ -673,6 +675,10 @@ def dispatch_tool(vm: PcmRuntimeClientSync, name: str, args: dict) -> str:
         return _format_read_response(path, start, end, num, r)
 
     if name == "write":
+        if "path" not in args:
+            return "Error: write() called without required 'path' argument. Retry with path='<full/path/to/file>'."
+        if "content" not in args:
+            return "Error: write() called without required 'content' argument. Retry with content='...'."
         path    = args["path"]
         content = args["content"]
         start   = int(args.get("start_line", 0))
@@ -681,10 +687,14 @@ def dispatch_tool(vm: PcmRuntimeClientSync, name: str, args: dict) -> str:
         return f"write {path}: ok"
 
     if name == "delete":
+        if "path" not in args:
+            return "Error: delete() called without required 'path' argument. Retry with path='<full/path/to/file>'."
         vm.delete(DeleteRequest(path=args["path"]))
         return f"delete {args['path']}: ok"
 
     if name == "mkdir":
+        if "path" not in args:
+            return "Error: mkdir() called without required 'path' argument. Retry with path='<full/path/to/dir>'."
         vm.mk_dir(MkDirRequest(path=args["path"]))
         return f"mkdir {args['path']}: ok"
 
