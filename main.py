@@ -295,7 +295,7 @@ def main() -> None:
     analyzer = _make_analyzer_client()
 
     try:
-        harness = HarnessServiceClientSync(BITGN_URL)
+        harness = HarnessServiceClientSync(BITGN_URL, api_key=BITGN_API_KEY)
         print(f"BitGN: {harness.status(StatusRequest())}")
 
         res = harness.get_benchmark(GetBenchmarkRequest(benchmark_id=BENCHMARK_ID))
@@ -322,7 +322,6 @@ def main() -> None:
             run = harness.start_run(StartRunRequest(
                 name=run_name,
                 benchmark_id=BENCHMARK_ID,
-                api_key=BITGN_API_KEY,
             ))
             print(f"{CLI_CYAN}[leaderboard] run_id={run.run_id} ({len(run.trial_ids)} trials){CLI_CLR}")
             try:
