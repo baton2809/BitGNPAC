@@ -322,6 +322,7 @@ def main() -> None:
             run = harness.start_run(StartRunRequest(
                 name=run_name,
                 benchmark_id=BENCHMARK_ID,
+                api_key=BITGN_API_KEY,
             ))
             print(f"{CLI_CYAN}[leaderboard] run_id={run.run_id} ({len(run.trial_ids)} trials){CLI_CLR}")
             try:

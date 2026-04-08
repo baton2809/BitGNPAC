@@ -28,34 +28,30 @@ def _m(name, req, res):
 class HarnessServiceClientSync:
     def __init__(self, address: str, api_key: str = ""):
         self._c = ConnectClientSync(address)
-        self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
-
-    def _h(self):
-        return self._headers
 
     def status(self, req: StatusRequest) -> StatusResponse:
-        return self._c.execute_unary(request=req, method=_m("Status", StatusRequest, StatusResponse), headers=self._h())
+        return self._c.execute_unary(request=req, method=_m("Status", StatusRequest, StatusResponse))
 
     def get_benchmark(self, req: GetBenchmarkRequest) -> GetBenchmarkResponse:
-        return self._c.execute_unary(request=req, method=_m("GetBenchmark", GetBenchmarkRequest, GetBenchmarkResponse), headers=self._h())
+        return self._c.execute_unary(request=req, method=_m("GetBenchmark", GetBenchmarkRequest, GetBenchmarkResponse))
 
     def start_run(self, req: StartRunRequest) -> StartRunResponse:
-        return self._c.execute_unary(request=req, method=_m("StartRun", StartRunRequest, StartRunResponse), headers=self._h())
+        return self._c.execute_unary(request=req, method=_m("StartRun", StartRunRequest, StartRunResponse))
 
     def get_run(self, req: GetRunRequest) -> GetRunResponse:
-        return self._c.execute_unary(request=req, method=_m("GetRun", GetRunRequest, GetRunResponse), headers=self._h())
+        return self._c.execute_unary(request=req, method=_m("GetRun", GetRunRequest, GetRunResponse))
 
     def submit_run(self, req: SubmitRunRequest) -> SubmitRunResponse:
-        return self._c.execute_unary(request=req, method=_m("SubmitRun", SubmitRunRequest, SubmitRunResponse), headers=self._h())
+        return self._c.execute_unary(request=req, method=_m("SubmitRun", SubmitRunRequest, SubmitRunResponse))
 
     def start_playground(self, req: StartPlaygroundRequest) -> StartPlaygroundResponse:
-        return self._c.execute_unary(request=req, method=_m("StartPlayground", StartPlaygroundRequest, StartPlaygroundResponse), headers=self._h())
+        return self._c.execute_unary(request=req, method=_m("StartPlayground", StartPlaygroundRequest, StartPlaygroundResponse))
 
     def start_trial(self, req: StartTrialRequest) -> StartTrialResponse:
-        return self._c.execute_unary(request=req, method=_m("StartTrial", StartTrialRequest, StartTrialResponse), headers=self._h())
+        return self._c.execute_unary(request=req, method=_m("StartTrial", StartTrialRequest, StartTrialResponse))
 
     def get_trial(self, req: GetTrialRequest) -> GetTrialResponse:
-        return self._c.execute_unary(request=req, method=_m("GetTrial", GetTrialRequest, GetTrialResponse), headers=self._h())
+        return self._c.execute_unary(request=req, method=_m("GetTrial", GetTrialRequest, GetTrialResponse))
 
     def end_trial(self, req: EndTrialRequest) -> EndTrialResponse:
-        return self._c.execute_unary(request=req, method=_m("EndTrial", EndTrialRequest, EndTrialResponse), headers=self._h())
+        return self._c.execute_unary(request=req, method=_m("EndTrial", EndTrialRequest, EndTrialResponse))
