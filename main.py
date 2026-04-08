@@ -28,6 +28,9 @@ from bitgn.harness_pb2 import (
     EvalPolicy,
     GetBenchmarkRequest,
     StartPlaygroundRequest,
+    StartRunRequest,
+    StartTrialRequest,
+    SubmitRunRequest,
     StatusRequest,
 )
 from connectrpc.errors import ConnectError
@@ -38,6 +41,7 @@ from agent import run_agent, log_header, CLI_GREEN, CLI_RED, CLI_CLR, CLI_YELLOW
 
 BITGN_URL      = os.getenv("BENCHMARK_HOST")     or "https://api.bitgn.com"
 BENCHMARK_ID   = os.getenv("BENCHMARK_ID")       or "bitgn/pac1-dev"
+BITGN_API_KEY  = os.getenv("BITGN_API_KEY")      or ""
 MODEL_ID       = os.getenv("MODEL_ID")           or "gpt-oss:20b"
 PARALLEL_TASKS = int(os.getenv("PARALLEL_TASKS") or "1")
 
@@ -216,10 +220,12 @@ def run_task(
     wiki_cache: dict,
     lessons: list[str],
     current_hint: str,
+    trial=None,  # pre-started trial (from start_trial); if None — use start_playground
 ) -> tuple | None:
-    trial = client.start_playground(
-        StartPlaygroundRequest(benchmark_id=BENCHMARK_ID, task_id=task.task_id)
-    )
+    if trial is None:
+        trial = client.start_playground(
+            StartPlaygroundRequest(benchmark_id=BENCHMARK_ID, task_id=task.task_id)
+        )
     log_header(task.task_id, trial.instruction)
 
     # Preflight: fetch wiki (cached per harness_url)
@@ -304,12 +310,46 @@ def main() -> None:
             model_info += f" | analyzer+versioner=cerebras/{CEREBRAS_MODEL}"
         print(f"{model_info} | parallel={PARALLEL_TASKS}\n")
 
+        tasks_by_id = {t.task_id: t for t in res.tasks}
         tasks_to_run = [
             t for t in res.tasks
             if not task_filter or t.task_id in task_filter
         ]
 
-        if PARALLEL_TASKS > 1:
+        # ── Leaderboard run (api_key set) vs playground ───────────────────
+        if BITGN_API_KEY:
+            run_name = f"run model={MODEL_ID}"
+            run = harness.start_run(StartRunRequest(
+                name=run_name,
+                benchmark_id=BENCHMARK_ID,
+                api_key=BITGN_API_KEY,
+            ))
+            print(f"{CLI_CYAN}[leaderboard] run_id={run.run_id} ({len(run.trial_ids)} trials){CLI_CLR}")
+            try:
+                for trial_id in run.trial_ids:
+                    trial = harness.start_trial(StartTrialRequest(trial_id=trial_id))
+                    task  = tasks_by_id.get(trial.task_id)
+                    if task_filter and trial.task_id not in task_filter:
+                        continue
+                    r = run_task(harness, task, analyzer, wiki_cache, raw_lessons, current_hint, trial=trial)
+                    if r is None:
+                        continue
+                    task_id, score, score_detail, instruction, action_log, stats = r
+                    scores.append((task_id, score))
+                    all_stats.append((task_id, score, stats))
+                    if score < 1.0:
+                        lesson = extract_lesson(analyzer, instruction, action_log, score, score_detail)
+                        if lesson:
+                            raw_lessons.append(lesson)
+                            print(f"{CLI_YELLOW}[{len(raw_lessons)} lessons]{CLI_CLR}")
+                            if len(raw_lessons) % VERSIONER_EVERY == 0:
+                                print(f"{CLI_CYAN}[versioner] running...{CLI_CLR}")
+                                current_hint = run_versioner(analyzer, raw_lessons, current_hint)
+            finally:
+                harness.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
+                print(f"{CLI_CYAN}[leaderboard] run submitted → https://bitgn.com/l/pac1-dev{CLI_CLR}")
+
+        elif PARALLEL_TASKS > 1:
             # Параллельный режим: без self-evolving
             print(f"Parallel mode: {len(tasks_to_run)} tasks × {PARALLEL_TASKS} workers")
             with ThreadPoolExecutor(max_workers=PARALLEL_TASKS) as executor:
