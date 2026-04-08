@@ -324,27 +324,65 @@ def main() -> None:
                 benchmark_id=BENCHMARK_ID,
                 api_key=BITGN_API_KEY,
             ))
-            print(f"{CLI_CYAN}[leaderboard] run_id={run.run_id} ({len(run.trial_ids)} trials){CLI_CLR}")
+            print(f"{CLI_CYAN}[leaderboard] run_id={run.run_id} ({len(run.trial_ids)} trials) workers={PARALLEL_TASKS}{CLI_CLR}")
+
+            # Filter trial_ids by task_filter if set (peek task_id without full start)
+            # For competition: no filter → all trial_ids used
+            trials_to_run = [
+                tid for tid in run.trial_ids
+                if not task_filter  # when task_filter set, we'll check after start_trial
+            ]
+            if task_filter:
+                # Need to peek task_id — start_trial is the only way
+                for tid in run.trial_ids:
+                    tr = harness.start_trial(StartTrialRequest(trial_id=tid))
+                    if tr.task_id in task_filter:
+                        trials_to_run.append(tr)  # store full trial object
+                trial_ids_to_run = trials_to_run  # mixed: str ids or trial objects
+            else:
+                trial_ids_to_run = trials_to_run  # list of str trial_ids
+
+            def _run_leaderboard_trial(tid_or_trial):
+                if isinstance(tid_or_trial, str):
+                    trial = harness.start_trial(StartTrialRequest(trial_id=tid_or_trial))
+                else:
+                    trial = tid_or_trial
+                task = tasks_by_id.get(trial.task_id)
+                return run_task(harness, task, analyzer, {}, [], "", trial=trial)
+
             try:
-                for trial_id in run.trial_ids:
-                    trial = harness.start_trial(StartTrialRequest(trial_id=trial_id))
-                    task  = tasks_by_id.get(trial.task_id)
-                    if task_filter and trial.task_id not in task_filter:
-                        continue
-                    r = run_task(harness, task, analyzer, wiki_cache, raw_lessons, current_hint, trial=trial)
-                    if r is None:
-                        continue
-                    task_id, score, score_detail, instruction, action_log, stats = r
-                    scores.append((task_id, score))
-                    all_stats.append((task_id, score, stats))
-                    if score < 1.0:
-                        lesson = extract_lesson(analyzer, instruction, action_log, score, score_detail)
-                        if lesson:
-                            raw_lessons.append(lesson)
-                            print(f"{CLI_YELLOW}[{len(raw_lessons)} lessons]{CLI_CLR}")
-                            if len(raw_lessons) % VERSIONER_EVERY == 0:
-                                print(f"{CLI_CYAN}[versioner] running...{CLI_CLR}")
-                                current_hint = run_versioner(analyzer, raw_lessons, current_hint)
+                if PARALLEL_TASKS > 1:
+                    with ThreadPoolExecutor(max_workers=PARALLEL_TASKS) as executor:
+                        futures = {executor.submit(_run_leaderboard_trial, t): t for t in trial_ids_to_run}
+                        for future in as_completed(futures):
+                            try:
+                                r = future.result()
+                                if r:
+                                    scores.append((r[0], r[1]))
+                                    all_stats.append((r[0], r[1], r[5]))
+                            except Exception as exc:
+                                safe_print(f"Trial error: {exc}")
+                else:
+                    for tid_or_trial in trial_ids_to_run:
+                        if isinstance(tid_or_trial, str):
+                            trial = harness.start_trial(StartTrialRequest(trial_id=tid_or_trial))
+                        else:
+                            trial = tid_or_trial
+                        task = tasks_by_id.get(trial.task_id)
+                        r = run_task(harness, task, analyzer, wiki_cache, raw_lessons, current_hint, trial=trial)
+                        if r is None:
+                            continue
+                        task_id, score, score_detail, instruction, action_log, stats = r
+                        scores.append((task_id, score))
+                        all_stats.append((task_id, score, stats))
+                        if score < 1.0:
+                            lesson = extract_lesson(analyzer, instruction, action_log, score, score_detail)
+                            if lesson:
+                                raw_lessons.append(lesson)
+                                print(f"{CLI_YELLOW}[{len(raw_lessons)} lessons]{CLI_CLR}")
+                                if len(raw_lessons) % VERSIONER_EVERY == 0:
+                                    print(f"{CLI_CYAN}[versioner] running...{CLI_CLR}")
+                                    current_hint = run_versioner(analyzer, raw_lessons, current_hint)
             finally:
                 harness.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
                 print(f"{CLI_CYAN}[leaderboard] run submitted → https://bitgn.com/l/pac1-dev{CLI_CLR}")
