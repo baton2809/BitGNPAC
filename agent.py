@@ -880,18 +880,22 @@ def run_agent(
     task_text: str,
     wiki_content: str = "",
     extra_hint: str = "",
+    openai_client: OpenAI | None = None,
+    key_pool=None,  # _KeyPool instance for 429 failover (optional)
 ) -> list[dict]:
     """
     Run the agent for one task.
 
     Args:
-        wiki_content: pre-fetched AGENTS.md content injected into system prompt
-        extra_hint:   accumulated lessons from Analyzer/Versioner
+        wiki_content:   pre-fetched AGENTS.md content injected into system prompt
+        extra_hint:     accumulated lessons from Analyzer/Versioner
+        openai_client:  optional pre-built OpenAI client (for key rotation / OpenRouter)
+        key_pool:       _KeyPool instance; on 429 the agent switches to the next key immediately
 
     Returns action_log for Analyzer.
     Guarantees vm.answer called exactly once.
     """
-    client = OpenAI()
+    client = openai_client if openai_client is not None else OpenAI()
     vm     = PcmRuntimeClientSync(harness_url)
     stagnation    = StagnationDetector(threshold=3)
     answer_called = False
@@ -1035,6 +1039,13 @@ def run_agent(
                     is_rate_limit = (
                         isinstance(_api_err, APIStatusError) and _api_err.status_code == 429
                     )
+                    if is_rate_limit and key_pool is not None:
+                        # Failover: mark current key as rate-limited, switch immediately
+                        next_client = key_pool.on_rate_limit(client)
+                        if next_client is not None and next_client is not client:
+                            log_warn(f"429 rate limit — switching to next API key (attempt {_attempt+1}/5)")
+                            client = next_client
+                            continue  # retry immediately with new key, no sleep
                     if is_rate_limit:
                         wait = min(15 * (2 ** _attempt), 120)  # 15, 30, 60, 120s
                     else:

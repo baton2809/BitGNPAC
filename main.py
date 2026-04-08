@@ -16,7 +16,7 @@ import os
 import sys
 import textwrap
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 
 from openai import OpenAI
 
@@ -45,9 +45,16 @@ BITGN_API_KEY  = os.getenv("BITGN_API_KEY")      or ""
 MODEL_ID       = os.getenv("MODEL_ID")           or "gpt-oss:20b"
 PARALLEL_TASKS = int(os.getenv("PARALLEL_TASKS") or "1")
 
-# OpenRouter: задайте OPENROUTER_API_KEY для использования облачных моделей (напр. qwen/qwen3.6-plus-preview)
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
+# OpenRouter: OPENROUTER_API_KEY, OPENROUTER_API_KEY_2 .. OPENROUTER_API_KEY_9 (любое кол-во)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY") or ""
+_OPENROUTER_ALL_KEYS = [
+    k for k in [
+        OPENROUTER_API_KEY,
+        *[os.getenv(f"OPENROUTER_API_KEY_{i}") or "" for i in range(2, 10)],
+    ]
+    if k
+]
 
 # Cerebras: задайте CEREBRAS_API_KEY для использования llama-3.3-70b в analyzer/versioner
 CEREBRAS_API_KEY  = os.getenv("CEREBRAS_API_KEY")
@@ -63,6 +70,81 @@ _print_lock = threading.Lock()
 def safe_print(*args, **kwargs):
     with _print_lock:
         print(*args, **kwargs)
+
+
+# ─── OpenRouter key pool ───────────────────────────────────────────────────────
+
+class _KeyPool:
+    """
+    Round-robin pool of OpenAI clients for OpenRouter.
+    Supports on_rate_limit(client): temporarily skips the rate-limited key
+    for COOLDOWN seconds, returns the next available client immediately.
+    """
+    COOLDOWN = 60  # seconds to skip a rate-limited key
+
+    def __init__(self, keys: list[str]):
+        self._clients: list[OpenAI] = []
+        self._cooldown_until: list[float] = []  # per-client cooldown timestamp
+        for k in keys:
+            self._clients.append(OpenAI(api_key=k, base_url=OPENROUTER_BASE_URL))
+            self._cooldown_until.append(0.0)
+        self._idx = 0
+        self._lock = threading.Lock()
+        if self._clients:
+            safe_print(f"[key-pool] {len(self._clients)} OpenRouter key(s) loaded")
+
+    def next(self) -> "OpenAI | None":
+        """Return next available (non-rate-limited) client, or any if all limited."""
+        if not self._clients:
+            return None
+        with self._lock:
+            now = time.time()
+            n = len(self._clients)
+            # Try each slot starting from current idx, skip rate-limited
+            for _ in range(n):
+                i = self._idx % n
+                self._idx += 1
+                if now >= self._cooldown_until[i]:
+                    return self._clients[i]
+            # All keys are rate-limited — return least-recently limited
+            i = min(range(n), key=lambda x: self._cooldown_until[x])
+            return self._clients[i]
+
+    def on_rate_limit(self, client: "OpenAI") -> "OpenAI | None":
+        """
+        Mark client as rate-limited for COOLDOWN seconds.
+        Returns the next available client (different from this one if possible).
+        """
+        if not self._clients:
+            return None
+        with self._lock:
+            now = time.time()
+            n = len(self._clients)
+            # Mark this client as cooled down
+            for i, c in enumerate(self._clients):
+                if c is client:
+                    self._cooldown_until[i] = now + self.COOLDOWN
+                    safe_print(f"[key-pool] key[{i}] rate-limited, cooldown {self.COOLDOWN}s")
+                    break
+            # Return next non-limited client
+            for _ in range(n):
+                j = self._idx % n
+                self._idx += 1
+                if now >= self._cooldown_until[j]:
+                    return self._clients[j]
+            # All limited — return least-recently limited
+            j = min(range(n), key=lambda x: self._cooldown_until[x])
+            return self._clients[j]
+
+    def __bool__(self):
+        return bool(self._clients)
+
+
+_key_pool = _KeyPool(_OPENROUTER_ALL_KEYS)
+
+# ─── Shared wiki cache (thread-safe, double-checked locking) ──────────────────
+_wiki_cache: dict[str, str] = {}
+_wiki_lock = threading.Lock()
 
 
 # ─── Analyzer/Versioner clients ────────────────────────────────────────────────
@@ -217,7 +299,6 @@ def run_task(
     client: HarnessServiceClientSync,
     task,
     analyzer: OpenAI,
-    wiki_cache: dict,
     lessons: list[str],
     current_hint: str,
     trial=None,  # pre-started trial (from start_trial); if None — use start_playground
@@ -228,11 +309,13 @@ def run_task(
         )
     log_header(task.task_id, trial.instruction)
 
-    # Preflight: fetch wiki (cached per harness_url)
+    # Preflight: fetch wiki (shared cache, double-checked locking)
     url = trial.harness_url
-    if url not in wiki_cache:
-        wiki_cache[url] = fetch_wiki(url)
-    wiki_content = wiki_cache[url]
+    if url not in _wiki_cache:
+        with _wiki_lock:
+            if url not in _wiki_cache:  # double-check inside lock
+                _wiki_cache[url] = fetch_wiki(url)
+    wiki_content = _wiki_cache[url]
 
     action_log: list[dict] = []
     stats: dict = {}
@@ -243,6 +326,8 @@ def run_task(
             trial.instruction,
             wiki_content=wiki_content,
             extra_hint=current_hint,
+            openai_client=_key_pool.next() if _key_pool else None,
+            key_pool=_key_pool if _key_pool else None,
         )
     except Exception as exc:
         safe_print(f"{CLI_RED}run_agent exception: {exc}{CLI_CLR}")
@@ -276,9 +361,9 @@ def main() -> None:
     all_stats: list[tuple[str, float, dict]] = []  # (task_id, score, stats)
 
     # Self-evolving state
-    raw_lessons:   list[str] = []   # сырые уроки от Analyzer
-    current_hint:  str       = ""   # эволюционирующий hint от Versioner
-    wiki_cache:    dict      = {}   # кэш AGENTS.md per harness_url
+    raw_lessons:  list[str] = []   # сырые уроки от Analyzer
+    current_hint: str       = ""   # эволюционирующий hint от Versioner
+    # wiki_cache теперь глобальный _wiki_cache (thread-safe, shared across workers)
     # Versioner отключён: gpt-oss:20b галлюцинирует несуществующие типы действий.
     # Включить когда будет более мощная модель (gpt-oss:120b / cerebras).
     VERSIONER_EVERY = 999
@@ -342,13 +427,15 @@ def main() -> None:
             else:
                 trial_ids_to_run = trials_to_run  # list of str trial_ids
 
+            TASK_TIMEOUT = 300  # 5 min max per task
+
             def _run_leaderboard_trial(tid_or_trial):
                 if isinstance(tid_or_trial, str):
                     trial = harness.start_trial(StartTrialRequest(trial_id=tid_or_trial))
                 else:
                     trial = tid_or_trial
                 task = tasks_by_id.get(trial.task_id)
-                return run_task(harness, task, analyzer, {}, [], "", trial=trial)
+                return run_task(harness, task, analyzer, [], "", trial=trial)
 
             try:
                 if PARALLEL_TASKS > 1:
@@ -356,10 +443,12 @@ def main() -> None:
                         futures = {executor.submit(_run_leaderboard_trial, t): t for t in trial_ids_to_run}
                         for future in as_completed(futures):
                             try:
-                                r = future.result()
+                                r = future.result(timeout=TASK_TIMEOUT)
                                 if r:
                                     scores.append((r[0], r[1]))
                                     all_stats.append((r[0], r[1], r[5]))
+                            except FutureTimeoutError:
+                                safe_print(f"{CLI_RED}⚠ Trial timeout ({TASK_TIMEOUT}s) — skipping{CLI_CLR}")
                             except Exception as exc:
                                 safe_print(f"Trial error: {exc}")
                 else:
@@ -369,7 +458,7 @@ def main() -> None:
                         else:
                             trial = tid_or_trial
                         task = tasks_by_id.get(trial.task_id)
-                        r = run_task(harness, task, analyzer, wiki_cache, raw_lessons, current_hint, trial=trial)
+                        r = run_task(harness, task, analyzer, raw_lessons, current_hint, trial=trial)
                         if r is None:
                             continue
                         task_id, score, score_detail, instruction, action_log, stats = r
@@ -392,21 +481,23 @@ def main() -> None:
             print(f"Parallel mode: {len(tasks_to_run)} tasks × {PARALLEL_TASKS} workers")
             with ThreadPoolExecutor(max_workers=PARALLEL_TASKS) as executor:
                 futures = {
-                    executor.submit(run_task, harness, task, analyzer, {}, [], ""): task
+                    executor.submit(run_task, harness, task, analyzer, [], ""): task
                     for task in tasks_to_run
                 }
                 for future in as_completed(futures):
                     try:
-                        r = future.result()
+                        r = future.result(timeout=300)
                         if r:
                             scores.append((r[0], r[1]))
                             all_stats.append((r[0], r[1], r[5]))
+                    except FutureTimeoutError:
+                        safe_print(f"{CLI_RED}⚠ Task timeout (300s) — skipping{CLI_CLR}")
                     except Exception as exc:
                         safe_print(f"Task error: {exc}")
         else:
             # Последовательный режим: Main → Analyzer → Versioner
             for task in tasks_to_run:
-                r = run_task(harness, task, analyzer, wiki_cache, raw_lessons, current_hint)
+                r = run_task(harness, task, analyzer, raw_lessons, current_hint)
                 if r is None:
                     continue
 
