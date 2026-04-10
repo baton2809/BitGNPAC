@@ -16,6 +16,7 @@ import os
 import sys
 import textwrap
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 
 from openai import OpenAI
@@ -45,13 +46,13 @@ BITGN_API_KEY  = os.getenv("BITGN_API_KEY")      or ""
 MODEL_ID       = os.getenv("MODEL_ID")           or "gpt-oss:20b"
 PARALLEL_TASKS = int(os.getenv("PARALLEL_TASKS") or "1")
 
-# OpenRouter: OPENROUTER_API_KEY, OPENROUTER_API_KEY_2 .. OPENROUTER_API_KEY_9 (любое кол-во)
+# OpenRouter: OPENROUTER_API_KEY, OPENROUTER_API_KEY_2 .. OPENROUTER_API_KEY_10 (любое кол-во)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY") or ""
 _OPENROUTER_ALL_KEYS = [
     k for k in [
         OPENROUTER_API_KEY,
-        *[os.getenv(f"OPENROUTER_API_KEY_{i}") or "" for i in range(2, 10)],
+        *[os.getenv(f"OPENROUTER_API_KEY_{i}") or "" for i in range(2, 11)],
     ]
     if k
 ]

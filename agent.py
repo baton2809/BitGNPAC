@@ -1012,8 +1012,10 @@ def run_agent(
             think_level = os.environ.get("THINK_LEVEL", "high")
             base_url = os.environ.get("OPENAI_BASE_URL", "")
             is_openrouter = "openrouter.ai" in base_url
+            is_gemini = "generativelanguage.googleapis.com" in base_url
+            is_ollama = not is_openrouter and not is_gemini
             extra: dict = {}
-            if think_level and not is_openrouter:
+            if think_level and is_ollama:
                 extra["extra_body"] = {"think": True, "options": {"think_level": think_level}}
             elif is_openrouter and os.environ.get("THINKING_ENABLED"):
                 extra["extra_body"] = {"thinking": {"type": "enabled", "budget_tokens": 8000}}
