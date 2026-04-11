@@ -598,7 +598,58 @@ Even if a secondary file would be helpful, writing it causes an immediate grader
 ## verify_done
 Call verify_done before OUTCOME_OK ONLY if you actually wrote, deleted, or created files.
 If the task required no file changes (read-only, OUTCOME_NONE_*, OUTCOME_DENIED_*) — skip it.
-Max 40 tool calls per task — be efficient."""
+Max 40 tool calls per task — be efficient.
+
+## Finance ops — arithmetic and date precision
+When computing any numeric result (totals, balances, sums, outstanding amounts):
+1. Enumerate EVERY operand explicitly before computing — never skip steps.
+   Example: "Line items: 120.00 + 340.50 + 89.00 = 549.50" not just "Total: 549.50".
+2. For running totals: show intermediate sums ("120.00 + 340.50 = 460.50, + 89.00 = 549.50").
+3. For date arithmetic: resolve each step explicitly.
+   Example: "invoice date 2026-03-15 + 30 days = March has 31 days → April 14, 2026".
+4. For overdue amounts: compute days_overdue = today − due_date before applying late fees.
+5. For currency: preserve exact decimal precision from source files (2 decimal places).
+   Never round intermediate values — only round the final result if the schema demands it.
+6. After computing: state the final value once clearly, then write it to the file.
+If any source value is missing or ambiguous → OUTCOME_NONE_CLARIFICATION, not a guess.
+
+## Relationship ops — traversing entity chains
+When a task involves relationships between people, accounts, projects, or transactions:
+1. Map the chain BEFORE acting: e.g. contact → account → invoices → project.
+2. Use search/find to discover all related entities, not just the first match.
+3. When a person belongs to multiple accounts, or a project spans multiple accounts:
+   read ALL related account records before deciding which one the task concerns.
+4. "Who said what": find the source document first (meeting notes, thread, message),
+   read it fully, then extract the exact quote — never paraphrase from memory.
+5. "Which projects/accounts belong together": look for shared IDs (account_id, project_id)
+   across different directories, not just name similarity.
+6. Circular references (contact A → account B → contact A): break the cycle after first pass.
+
+## Document ops — deduplication and normalization
+When asked to clean, deduplicate, or organize document records:
+1. Load ALL candidate files before comparing — never delete on first sight.
+2. Deduplication key: identical records share the same primary identifier
+   (invoice_number, id, ref, or a combination of date + amount + party).
+3. If two records differ only in formatting (date format, whitespace, casing):
+   they ARE duplicates — keep the one with the more complete/canonical format.
+4. If two records differ in any substantive field (amount, name, date): they are NOT duplicates.
+5. After deduplication: verify the retained file is well-formed before deleting the duplicate.
+6. Normalization: when converting messy text to structured JSON, preserve every field
+   present in the source — do not drop fields that seem unimportant.
+7. Queuing to downstream workflow = writing to /outbox/ following the seq.json protocol.
+
+## Communication ops — replies and attachment bundles
+When preparing a reply or assembling an attachment bundle:
+1. Read the ORIGINAL message fully first — extract the exact request, sender, and context.
+2. Reply body: address every point raised in the original message explicitly.
+   Do not write a generic reply — reference the specific invoice, date, amount, or item asked about.
+3. Attachment bundle: search the relevant directory for ALL files matching the request
+   (e.g. all invoices for account X, all docs for project Y) before deciding what to include.
+4. Attachments field: use FULL paths from root (e.g. "invoices/INV-042.json").
+   Never use bare filenames. Include ONLY files that directly answer the request — no extras.
+5. If the task says "resend" a document: find the EXACT previous outbox entry for that document,
+   read the original content, replicate it faithfully (same recipient, same subject, same attachment).
+6. cc/bcc fields: only populate if explicitly requested or if AGENTS.MD specifies routing rules."""
 
 
 # ─── Formatting helpers ────────────────────────────────────────────────────────
@@ -1104,7 +1155,7 @@ def run_agent(
                 extra["extra_body"] = {"thinking": {"type": "enabled", "budget_tokens": 8000}}
 
             resp = None
-            for _attempt in range(5):
+            for _attempt in range(3):
                 try:
                     resp = client.chat.completions.create(
                         model=model,
@@ -1117,9 +1168,9 @@ def run_agent(
                     )
                     if resp.choices:
                         break
-                    # Empty choices (OpenRouter transient) — retry with backoff
-                    wait = min(15 * (2 ** _attempt), 120)
-                    log_warn(f"LLM returned empty choices, retry {_attempt+1}/5 in {wait}s...")
+                    # Empty choices (OpenRouter transient) — quick retry
+                    wait = 1.0 if _attempt == 0 else 2.0
+                    log_warn(f"LLM returned empty choices, retry {_attempt+1}/3 in {wait}s...")
                     time.sleep(wait)
                 except (APIStatusError, APIConnectionError) as _api_err:
                     is_rate_limit = (
@@ -1129,17 +1180,19 @@ def run_agent(
                         # Failover: mark current key as rate-limited, switch immediately
                         next_client = key_pool.on_rate_limit(client)
                         if next_client is not None and next_client is not client:
-                            log_warn(f"429 rate limit — switching to next API key (attempt {_attempt+1}/5)")
                             client = next_client
+                            if key_pool.is_local(client):
+                                model = key_pool.local_model
+                                log_warn(f"429 rate limit — switched to local fallback ({model})")
+                            else:
+                                log_warn(f"429 rate limit — switching to next API key (attempt {_attempt+1}/3)")
                             continue  # retry immediately with new key, no sleep
-                    if is_rate_limit:
-                        wait = min(15 * (2 ** _attempt), 120)  # 15, 30, 60, 120s
-                    else:
-                        wait = min(2 ** _attempt, 30)          # 1, 2, 4, 8, 16s
-                    log_warn(f"LLM error ({_api_err}), retry {_attempt+1}/5 in {wait}s...")
+                    # Transient error: quick retry, fail fast
+                    wait = 0.5 if _attempt == 0 else 1.0
+                    log_warn(f"LLM error ({type(_api_err).__name__}), retry {_attempt+1}/3 in {wait}s...")
                     time.sleep(wait)
             else:
-                msg = "LLM returned empty choices after 5 retries." if (resp and not resp.choices) else "LLM API failed after 5 retries."
+                msg = "LLM returned empty choices after 3 retries." if (resp and not resp.choices) else "LLM API failed after 3 retries."
                 _submit_answer(msg, Outcome.OUTCOME_ERR_INTERNAL, grounding_refs)
                 return action_log, _get_stats()
 
@@ -1210,16 +1263,34 @@ def run_agent(
                         ),
                     })
                     continue
-                log_warn(f"No tool call (finish={finish}). Agent stopped.")
-                _submit_answer(
-                    f"Agent stopped without report_completion (finish={finish}): {raw_content[:300]}",
-                    Outcome.OUTCOME_ERR_INTERNAL,
-                    grounding_refs,
-                )
+                log_warn(f"No tool call (finish={finish}). Forcing report_completion...")
+                try:
+                    _forced_resp = client.chat.completions.create(
+                        model=model,
+                        messages=log,
+                        tools=TOOLS,
+                        tool_choice={"type": "function", "function": {"name": "report_completion"}},
+                        max_completion_tokens=1024,
+                        temperature=0,
+                    )
+                    _ftcs = (_forced_resp.choices[0].message.tool_calls or []) if _forced_resp.choices else []
+                    if _ftcs:
+                        _fargs = json.loads(_ftcs[0].function.arguments)
+                        _outcome = _fargs.get("outcome", "OUTCOME_ERR_INTERNAL").strip().strip('"').strip("'")
+                        _message = _fargs.get("message", "forced completion")
+                        _frefs   = _fargs.get("grounding_refs") or grounding_refs
+                        log_warn(f"[FORCE_TOOL] forced outcome: {_outcome}")
+                        _submit_answer(_message, OUTCOME_BY_NAME.get(_outcome, Outcome.OUTCOME_ERR_INTERNAL), _frefs)
+                    else:
+                        _submit_answer(f"Agent stopped (finish={finish}), force-tool returned no call.", Outcome.OUTCOME_ERR_INTERNAL, grounding_refs)
+                except Exception as _fe:
+                    _submit_answer(f"Agent stopped (finish={finish}), force-tool error: {_fe}", Outcome.OUTCOME_ERR_INTERNAL, grounding_refs)
                 break
 
             tc        = msg.tool_calls[0]
-            tool_name = tc.function.name
+            # HARMONY fix: gpt-oss-120b sometimes emits corrupted names like
+            # "read_file<|channel|>commentary" or "write;extra" — strip the suffix.
+            tool_name = re.split(r'[<;|,]', tc.function.name)[0].strip()
             try:
                 tool_args = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
@@ -1252,8 +1323,21 @@ def run_agent(
                 if isinstance(outcome, str):
                     outcome = outcome.strip().strip('"').strip("'")
                 message = tool_args.get("message", "")
-                refs    = tool_args.get("grounding_refs") or grounding_refs
                 steps   = tool_args.get("completed_steps_laconic", [])
+
+                # Merge: model's refs + auto-tracked (model may forget some paths)
+                _skip_names = {'README.MD', 'README.md', 'AGENTS.md', 'AGENTS.MD'}
+                _skip_pfx   = ('/docs/', '/99_process/', '/90_memory/')
+                _model_refs = tool_args.get("grounding_refs") or []
+                _merged = dict.fromkeys(
+                    r for r in _model_refs
+                    if r and not r.startswith("(") and r.lstrip("/") and "." in r.split("/")[-1]
+                )
+                for _r in grounding_refs:
+                    _bn = _r.rsplit("/", 1)[-1] if "/" in _r else _r
+                    if _r and _bn not in _skip_names and not any(_r.startswith(p) for p in _skip_pfx):
+                        _merged.setdefault(_r, None)
+                refs = list(_merged.keys())
 
                 # Nudge: if OUTCOME_OK without verify_done, only force it when
                 # agent actually WROTE or DELETED files (has side effects to verify).

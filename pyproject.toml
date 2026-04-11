@@ -9,9 +9,8 @@ dependencies = [
     "grpcio>=1.71.0",
     "grpcio-tools>=1.71.0",
     "protobuf>=5.0.0",
-    "openai>=2.0.0",
+    "openai>=2.26.0",
     "pydantic>=2.12.5",
-    "anthropic>=0.50.0",
 ]
 
 [tool.uv]

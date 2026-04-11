@@ -41,7 +41,7 @@ from agent import run_agent, log_header, CLI_GREEN, CLI_RED, CLI_CLR, CLI_YELLOW
 # ─── Config ────────────────────────────────────────────────────────────────────
 
 BITGN_URL      = os.getenv("BENCHMARK_HOST")     or "https://api.bitgn.com"
-BENCHMARK_ID   = os.getenv("BENCHMARK_ID")       or "bitgn/pac1-dev"
+BENCHMARK_ID   = os.getenv("BENCHMARK_ID")       or "bitgn/pac1-prod"
 BITGN_API_KEY  = os.getenv("BITGN_API_KEY")      or ""
 MODEL_ID       = os.getenv("MODEL_ID")           or "gpt-oss:20b"
 PARALLEL_TASKS = int(os.getenv("PARALLEL_TASKS") or "1")
@@ -56,6 +56,14 @@ _OPENROUTER_ALL_KEYS = [
     ]
     if k
 ]
+
+# Local fallback model (used when all OpenRouter keys are rate-limited)
+# Set LOCAL_BASE_URL to your Ollama endpoint, LOCAL_MODEL_ID to the model name
+_raw_ollama = os.getenv("OLLAMA_BASE_URL", "").rstrip("/")
+LOCAL_MODEL_ID = os.getenv("LOCAL_MODEL_ID") or "gpt-oss:20b"
+LOCAL_BASE_URL = os.getenv("LOCAL_BASE_URL") or (
+    (_raw_ollama + "/v1") if _raw_ollama else "http://localhost:11434/v1"
+)
 
 # Cerebras: задайте CEREBRAS_API_KEY для использования llama-3.3-70b в analyzer/versioner
 CEREBRAS_API_KEY  = os.getenv("CEREBRAS_API_KEY")
@@ -80,10 +88,11 @@ class _KeyPool:
     Round-robin pool of OpenAI clients for OpenRouter.
     Supports on_rate_limit(client): temporarily skips the rate-limited key
     for COOLDOWN seconds, returns the next available client immediately.
+    When ALL OpenRouter keys are rate-limited, falls back to a local model client.
     """
     COOLDOWN = 60  # seconds to skip a rate-limited key
 
-    def __init__(self, keys: list[str]):
+    def __init__(self, keys: list[str], local_base_url: str = "", local_model: str = ""):
         self._clients: list[OpenAI] = []
         self._cooldown_until: list[float] = []  # per-client cooldown timestamp
         for k in keys:
@@ -94,10 +103,24 @@ class _KeyPool:
         if self._clients:
             safe_print(f"[key-pool] {len(self._clients)} OpenRouter key(s) loaded")
 
+        # Local fallback: used when all OR keys are rate-limited or none provided
+        self._local_client: OpenAI | None = None
+        self._local_model: str = local_model
+        if local_base_url:
+            self._local_client = OpenAI(api_key="local", base_url=local_base_url)
+            safe_print(f"[key-pool] local fallback: {local_base_url} ({local_model})")
+
+    @property
+    def local_model(self) -> str:
+        return self._local_model
+
+    def is_local(self, client: "OpenAI") -> bool:
+        return self._local_client is not None and client is self._local_client
+
     def next(self) -> "OpenAI | None":
-        """Return next available (non-rate-limited) client, or any if all limited."""
+        """Return next available (non-rate-limited) client, or local fallback if all exhausted."""
         if not self._clients:
-            return None
+            return self._local_client  # pure-local mode
         with self._lock:
             now = time.time()
             n = len(self._clients)
@@ -107,7 +130,11 @@ class _KeyPool:
                 self._idx += 1
                 if now >= self._cooldown_until[i]:
                     return self._clients[i]
-            # All keys are rate-limited — return least-recently limited
+            # All OpenRouter keys are rate-limited — use local fallback
+            if self._local_client:
+                safe_print("[key-pool] all OR keys exhausted — using local fallback")
+                return self._local_client
+            # No local fallback — return least-recently limited key (will retry)
             i = min(range(n), key=lambda x: self._cooldown_until[x])
             return self._clients[i]
 
@@ -115,9 +142,13 @@ class _KeyPool:
         """
         Mark client as rate-limited for COOLDOWN seconds.
         Returns the next available client (different from this one if possible).
+        Falls back to local model if all OR keys become exhausted.
         """
         if not self._clients:
-            return None
+            return self._local_client
+        # Local client can't be rate-limited — just return it again
+        if client is self._local_client:
+            return self._local_client
         with self._lock:
             now = time.time()
             n = len(self._clients)
@@ -133,15 +164,19 @@ class _KeyPool:
                 self._idx += 1
                 if now >= self._cooldown_until[j]:
                     return self._clients[j]
-            # All limited — return least-recently limited
+            # All OpenRouter keys exhausted — use local fallback
+            if self._local_client:
+                safe_print("[key-pool] all OR keys rate-limited — switching to local fallback")
+                return self._local_client
+            # No local fallback — return least-recently limited
             j = min(range(n), key=lambda x: self._cooldown_until[x])
             return self._clients[j]
 
     def __bool__(self):
-        return bool(self._clients)
+        return bool(self._clients) or self._local_client is not None
 
 
-_key_pool = _KeyPool(_OPENROUTER_ALL_KEYS)
+_key_pool = _KeyPool(_OPENROUTER_ALL_KEYS, local_base_url=LOCAL_BASE_URL, local_model=LOCAL_MODEL_ID)
 
 # ─── Shared wiki cache (thread-safe, double-checked locking) ──────────────────
 _wiki_cache: dict[str, str] = {}
@@ -321,13 +356,19 @@ def run_task(
     action_log: list[dict] = []
     stats: dict = {}
     try:
+        _initial_client = _key_pool.next() if _key_pool else None
+        _initial_model  = (
+            _key_pool.local_model
+            if _key_pool and _initial_client and _key_pool.is_local(_initial_client)
+            else MODEL_ID
+        )
         action_log, stats = run_agent(
-            MODEL_ID,
+            _initial_model,
             url,
             trial.instruction,
             wiki_content=wiki_content,
             extra_hint=current_hint,
-            openai_client=_key_pool.next() if _key_pool else None,
+            openai_client=_initial_client,
             key_pool=_key_pool if _key_pool else None,
         )
     except Exception as exc:
@@ -475,7 +516,7 @@ def main() -> None:
                                     current_hint = run_versioner(analyzer, raw_lessons, current_hint)
             finally:
                 harness.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
-                print(f"{CLI_CYAN}[leaderboard] run submitted → https://bitgn.com/l/pac1-dev{CLI_CLR}")
+                print(f"{CLI_CYAN}[leaderboard] run submitted → https://bitgn.com/l/pac1-prod{CLI_CLR}")
 
         elif PARALLEL_TASKS > 1:
             # Параллельный режим: без self-evolving
